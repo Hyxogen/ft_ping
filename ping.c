@@ -8,6 +8,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <arpa/inet.h>
 
 static const char *program_name = NULL;
 
@@ -21,6 +22,7 @@ struct ping_ctx {
 	struct sockaddr_in addr;
 	struct icmp_echo base;
 	size_t baselen;
+	useconds_t interval;
 };
 
 static void error(const char *s)
@@ -32,22 +34,42 @@ static void error(const char *s)
 		fprintf(stderr, "%s: %s\n", program_name, err);
 }
 
+static uint16_t inet_checksum(const void *src, size_t len)
+{
+	const uint16_t *s = src;
+
+	assert(len <= 0x10000); // will not overflow below this length
+	uint32_t sum = 0;
+	while (len >= 2) {
+		sum += *s++;
+		len -= 2;
+	}
+	if (len)
+		sum += (uint16_t) *(uint8_t*)s << 8;
+
+	while (sum & ~0xFFFF) {
+		sum = (sum & 0xFFFF) + (sum >> 16);
+	}
+	return (uint16_t) ~sum;
+}
+
+
 static int do_ping(const struct ping_ctx *ctx)
 {
-	//printf("%i, %p, %zu, %p, %u\n", ctx->sockfd, &ctx->base, ctx->baselen, addr, len);
+	printf("do ping\n");
 	ssize_t nsent = sendto(ctx->sockfd, &ctx->base, ctx->baselen, 0,
 			       (const struct sockaddr *)&ctx->addr,
 			       sizeof(ctx->addr));
-	if (nsent < 0 || nsent < ctx->baselen) {
+	if (nsent < 0 || (unsigned long long) nsent < ctx->baselen) {
 		error("sendto");
 		return 1;
 	}
-	printf("wrote %li bytes\n", nsent);
 
-	char buf[1024];
+	struct icmp_echo *resp = malloc(sizeof(resp) + 128);
 	struct iovec iov;
-	iov.iov_base = buf;
-	iov.iov_len = sizeof(buf);
+	iov.iov_base = resp;
+	iov.iov_len = sizeof(resp) + 128;
+	memset(resp, 0, iov.iov_len);
 
 	char name[128];
 	char cbuf[512];
@@ -67,33 +89,33 @@ static int do_ping(const struct ping_ctx *ctx)
 		return 1;
 	}
 
-	fprintf(stdout, "%u bytes\n", (unsigned) nread);
+	char from[1024];
+	const char *tmp = inet_ntop(AF_INET, &ctx->addr.sin_addr, from, sizeof(from));
+	if (!tmp) {
+		error("inet_ntop");
+		return 1;
+	}
+
+	if (resp->header.type != ICMP_ECHOREPLY) {
+		fprintf(stderr, "not an echo reply, %hhu\n", resp->header.type);
+	}
+
+	uint16_t ch = inet_checksum(resp, nread);
+
+	if (ch) {
+		uint16_t *s = (uint16_t *) resp;
+		for (int i = 0; i < nread; i += 2) {
+			printf("%04hx ", s[i]);
+		}
+		printf("\n");
+		fprintf(stderr, "invalid checksum, packet said: %hx, we got %hx\n", resp->header.checksum, ch);
+	}
+
+	fprintf(stdout, "%u bytes from %s \n", (unsigned) nread, tmp);
 	return 0;
 }
 
-// TODO check for overflow
-static uint16_t checksum(const void *src, size_t len)
-{
-	const uint8_t *s = src;
-
-	uint32_t sum = 0;
-	size_t i = 0;
-	for (; i + 1 < len; i += 2) {
-		uint16_t word = ((uint16_t) s[i] << 8) + s[i + 1];
-		sum += word;
-	}
-	if (i < len) {
-		assert(0);
-		sum += ((uint32_t) s[i] << 8);
-	}
-
-	//printf("now: %x\n", sum);
-	while (sum & ~0xFFFF) {
-		sum = (sum & 0xFFFF) + (sum >> 16);
-	}
-	return (uint16_t) ~sum;
-}
-
+#ifndef TEST
 int main(int argc, char **argv)
 {
 	program_name = argv[0];
@@ -133,9 +155,49 @@ int main(int argc, char **argv)
 	ctx.base.header.un.echo.sequence = 0;
 	ctx.baselen = sizeof(ctx.base);
 
-	ctx.base.header.checksum = checksum(&ctx, ctx.baselen);
+	ctx.base.header.checksum = inet_checksum(&ctx, ctx.baselen);
 
-	if (do_ping(&ctx))
-		return EXIT_FAILURE;
+	ctx.interval = 1000;
+
+	for (;;) {
+		do_ping(&ctx);
+		usleep(ctx.interval * 1000);
+	}
 	return EXIT_SUCCESS;
 }
+
+#else
+
+#define ASSERT_U16_EQUAL_IMPL(a, astr, b, bstr, file, line)                         \
+	do {                                                                        \
+		if ((uint16_t)(a) != (uint16_t)(b)) {                               \
+			fprintf(stderr,                                             \
+				"%s:%i: Assertion `%s == %s` failed. %hu != %hu\n", \
+				file, line, astr, bstr, a, b);                      \
+			abort();                                                    \
+		}                                                                   \
+	} while (0)
+
+#define ASSERT_U16_EQUAL(a, b) ASSERT_U16_EQUAL_IMPL(a, #a, b, #b, __FILE__, __LINE__)
+
+static void test_inet_checksum()
+{
+	uint16_t zero = 0;
+	assert(inet_checksum(&zero, sizeof(zero)) == 0xffff);
+
+	for (uint32_t i = 0; i < 0x10000; ++i) {
+		if (i < 0xFF) {
+			ASSERT_U16_EQUAL(inet_checksum(&i, 1), ~(i << 8));
+		}
+		ASSERT_U16_EQUAL(inet_checksum(&i, 2), ~i);
+	}
+
+	uint16_t ab[] = { 0xffff, 0x00ab };
+	ASSERT_U16_EQUAL(inet_checksum(ab, sizeof (ab)), ~0x00ab);
+}
+
+int main()
+{
+	test_inet_checksum();
+}
+#endif
