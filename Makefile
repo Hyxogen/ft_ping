@@ -11,9 +11,6 @@ LFLAGS		:=
 
 LINK_CMD	:= $(CC)
 
-.PHONY: all clean fclean re check
--include $(DEP_FILES)
-
 all: $(NAME)
 
 $(NAME): $(OBJ_FILES)
@@ -33,3 +30,6 @@ fclean:
 re:
 	${MAKE} fclean
 	${MAKE}
+
+.PHONY: all clean fclean re check
+-include $(DEP_FILES)
