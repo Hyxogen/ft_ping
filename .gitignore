@@ -1,2 +1,4 @@
+/build
+/ft_ping
 .clang-format
 *.out
