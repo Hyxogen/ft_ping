@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <stdarg.h>
 
 static const char *program_name = NULL;
 
@@ -25,13 +26,22 @@ struct ping_ctx {
 	useconds_t interval;
 };
 
-static void error(const char *s)
+__attribute__((format(printf, 1, 2))) static void ping_error(const char *fmt,
+							     ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	fprintf(stderr, "%s: ", program_name);
+	vfprintf(stderr, fmt, ap);
+}
+
+static void ping_perror(const char *s)
 {
 	const char *err = strerror(errno);
 	if (s)
-		fprintf(stderr, "%s: %s\n", s, err);
+		ping_error("%s: %s\n", s, err);
 	else
-		fprintf(stderr, "%s: %s\n", program_name, err);
+		ping_error("%s\n", err);
 }
 
 static uint16_t inet_checksum(const void *src, size_t len)
@@ -45,23 +55,25 @@ static uint16_t inet_checksum(const void *src, size_t len)
 		len -= 2;
 	}
 	if (len)
-		sum += (uint16_t) *(uint8_t*)s << 8;
+		sum += (uint16_t) * (uint8_t *)s << 8;
 
 	while (sum & ~0xFFFF) {
 		sum = (sum & 0xFFFF) + (sum >> 16);
 	}
-	return (uint16_t) ~sum;
+	return (uint16_t)~sum;
 }
-
 
 static int do_ping(const struct ping_ctx *ctx)
 {
-	printf("do ping\n");
 	ssize_t nsent = sendto(ctx->sockfd, &ctx->base, ctx->baselen, 0,
 			       (const struct sockaddr *)&ctx->addr,
 			       sizeof(ctx->addr));
-	if (nsent < 0 || (unsigned long long) nsent < ctx->baselen) {
-		error("sendto");
+	if (nsent < 0) {
+		ping_perror("sendto");
+		return 1;
+	}
+	if ((unsigned long long)nsent < ctx->baselen) {
+		ping_error("sendto: unexpeced shortcount\n");
 		return 1;
 	}
 
@@ -85,14 +97,15 @@ static int do_ping(const struct ping_ctx *ctx)
 
 	ssize_t nread = recvmsg(ctx->sockfd, &msg, 0);
 	if (nread < 0) {
-		error("recvmsg");
+		ping_perror("recvmsg");
 		return 1;
 	}
 
 	char from[1024];
-	const char *tmp = inet_ntop(AF_INET, &ctx->addr.sin_addr, from, sizeof(from));
+	const char *tmp =
+		inet_ntop(AF_INET, &ctx->addr.sin_addr, from, sizeof(from));
 	if (!tmp) {
-		error("inet_ntop");
+		ping_perror("inet_ntop");
 		return 1;
 	}
 
@@ -103,15 +116,17 @@ static int do_ping(const struct ping_ctx *ctx)
 	uint16_t ch = inet_checksum(resp, nread);
 
 	if (ch) {
-		uint16_t *s = (uint16_t *) resp;
+		uint16_t *s = (uint16_t *)resp;
 		for (int i = 0; i < nread; i += 2) {
 			printf("%04hx ", s[i]);
 		}
 		printf("\n");
-		fprintf(stderr, "invalid checksum, packet said: %hx, we got %hx\n", resp->header.checksum, ch);
+		fprintf(stderr,
+			"invalid checksum, packet said: %hx, we got %hx\n",
+			resp->header.checksum, ch);
 	}
 
-	fprintf(stdout, "%u bytes from %s \n", (unsigned) nread, tmp);
+	fprintf(stdout, "%u bytes from %s \n", (unsigned)nread, tmp);
 	return 0;
 }
 
@@ -120,7 +135,7 @@ int main(int argc, char **argv)
 {
 	program_name = argv[0];
 	if (argc < 2) {
-		fprintf(stderr, "%s: destination address required\n", argv[0]);
+		ping_error("destination address required\n");
 		return EXIT_SUCCESS;
 	}
 
@@ -132,21 +147,21 @@ int main(int argc, char **argv)
 
 	int rc = getaddrinfo(argv[1], NULL, &hints, &res);
 	if (rc < 0) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
+		ping_error("getaddrinfo: %s\n", gai_strerror(rc));
 		return EXIT_FAILURE;
 	}
 
 	struct ping_ctx ctx;
 	ctx.sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	if (ctx.sockfd < 0) {
-		error("socket");
+		ping_perror("socket");
 		return EXIT_FAILURE;
 	}
 
-	ctx.addr = *(struct sockaddr_in*) res->ai_addr;
+	ctx.addr = *(struct sockaddr_in *)res->ai_addr;
 	ctx.addr.sin_family = AF_INET;
-	ctx.addr.sin_port = ((struct sockaddr_in*) res->ai_addr)->sin_port;
-	ctx.addr.sin_addr = ((struct sockaddr_in*) res->ai_addr)->sin_addr;
+	ctx.addr.sin_port = ((struct sockaddr_in *)res->ai_addr)->sin_port;
+	ctx.addr.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
 
 	ctx.base.header.type = ICMP_ECHO;
 	ctx.base.header.code = 0;
@@ -178,7 +193,8 @@ int main(int argc, char **argv)
 		}                                                                   \
 	} while (0)
 
-#define ASSERT_U16_EQUAL(a, b) ASSERT_U16_EQUAL_IMPL(a, #a, b, #b, __FILE__, __LINE__)
+#define ASSERT_U16_EQUAL(a, b) \
+	ASSERT_U16_EQUAL_IMPL(a, #a, b, #b, __FILE__, __LINE__)
 
 static void test_inet_checksum()
 {
@@ -193,7 +209,7 @@ static void test_inet_checksum()
 	}
 
 	uint16_t ab[] = { 0xffff, 0x00ab };
-	ASSERT_U16_EQUAL(inet_checksum(ab, sizeof (ab)), ~0x00ab);
+	ASSERT_U16_EQUAL(inet_checksum(ab, sizeof(ab)), ~0x00ab);
 }
 
 int main()
