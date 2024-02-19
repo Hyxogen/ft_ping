@@ -21,10 +21,14 @@ struct icmp_echo {
 
 struct ping_ctx {
 	int sockfd;
+
 	struct sockaddr *addr;
+	socklen_t addrlen;
+
 	size_t datalen;
 	unsigned char padding;
-	socklen_t addrlen;
+	int add_time;
+
 	useconds_t interval;
 };
 
@@ -140,6 +144,36 @@ static int send_echo(const struct ping_ctx *ctx, const struct icmp_echo *echo,
 	return 0;
 }
 
+static int print_ping(const struct ping_ctx *ctx, const struct icmp_echo *reply,
+		      int ttl, const struct sockaddr_in *from)
+{
+	struct timeval now;
+
+	if (gettimeofday(&now, NULL)) {
+		ping_perror("gettimeofday");
+		return 1;
+	}
+
+	char addr[INET_ADDRSTRLEN];
+	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
+		ping_perror("inet_ntop");
+		return 1;
+	}
+
+	printf("%zu bytes from %s: icmp_seq=%hu ttl=%i",
+		ctx->datalen + sizeof(struct icmphdr), addr,
+		ntohs(reply->header.un.echo.sequence), ttl);
+
+	if (ctx->add_time) {
+		struct timeval *sent = (struct timeval *)reply->data;
+		float ms = (now.tv_sec - sent->tv_sec) * 1000.0f +
+			   (now.tv_usec - sent->tv_usec) / 1000.0f;
+		printf(" time=%.3f ms", ms);
+	}
+	printf("\n");
+	return 0;
+}
+
 static void main_loop(struct ping_ctx *ctx)
 {
 	const size_t buflen = sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
@@ -152,12 +186,10 @@ static void main_loop(struct ping_ctx *ctx)
 	echo->header.checksum = 0;
 	echo->header.un.echo.id = 0;
 
-	int add_time = ctx->datalen > sizeof(struct timeval);
-
 	for (;;) {
 		echo->header.un.echo.sequence = htons(seqn);
 
-		if (add_time) {
+		if (ctx->add_time) {
 			if (gettimeofday((struct timeval*) echo->data, NULL)) {
 				ping_perror("gettimeofday");
 				continue;
@@ -178,28 +210,9 @@ static void main_loop(struct ping_ctx *ctx)
 				sizeof(from));
 		if (rc)
 			continue;
-		struct timeval now;
-		if (gettimeofday(&now, NULL)) {
-			ping_perror("gettimeofday");
-			continue;
-		}
 
-		char addr[INET_ADDRSTRLEN];
-		if (!inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr))) {
-			ping_perror("inet_ntop");
-			continue;
-		}
+		print_ping(ctx, buf, ttl, &from);
 
-		fprintf(stdout, "%zu bytes from %s: icmp_seq=%hu ttl=%i",
-			buflen, addr, ntohs(buf->header.un.echo.sequence), ttl);
-
-		if (add_time) {
-			struct timeval *sent = (struct timeval*) buf->data;
-			float ms = (now.tv_sec - sent->tv_sec) * 1000.0f +
-				   (now.tv_usec - sent->tv_usec) / 1000.0f;
-			fprintf(stdout, " time=%.3f ms", ms);
-		}
-		fprintf(stdout, "\n");
 		usleep(ctx->interval * 1000);
 		++seqn;
 	}
@@ -251,6 +264,8 @@ int main(int argc, char **argv)
 		ping_perror("setsockopt");
 		return EXIT_FAILURE;
 	}
+
+	ctx.add_time = ctx.datalen > sizeof(struct timeval);
 
 	main_loop(&ctx);
 	freeaddrinfo(res);
