@@ -119,7 +119,18 @@ static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
 	}
 
 	assert(ttl);
-	*ttl = 0; //TODO set
+
+	*ttl = 0;
+
+	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+	while (cmsg) {
+		if (cmsg->cmsg_level == IPPROTO_IP &&
+		    cmsg->cmsg_type == IP_TTL) {
+			memcpy(ttl, CMSG_DATA(cmsg), sizeof(*ttl));
+			break;
+		}
+		cmsg = CMSG_NXTHDR(&msg, cmsg);
+	}
 
 	return 0;
 }
@@ -258,13 +269,8 @@ int main(int argc, char **argv)
 
 	ctx.interval = 1000;
 
-	struct timeval timeout = {
-		.tv_sec = 1,
-		.tv_usec = 0,
-	};
-
-	if (setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-		       sizeof(timeout))) {
+	int yes = 1;
+	if (setsockopt(ctx.sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes))) {
 		ping_perror("setsockopt");
 		return EXIT_FAILURE;
 	}
