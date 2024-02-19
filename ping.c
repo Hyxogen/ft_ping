@@ -12,8 +12,6 @@
 #include <arpa/inet.h>
 #include <stdarg.h>
 
-#define MAX_BODY_SIZE 128
-
 struct icmp_echo {
 	struct icmphdr header;
 	unsigned char data[];
@@ -126,9 +124,23 @@ static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
 	return 0;
 }
 
-static int send_echo(const struct ping_ctx *ctx, const struct icmp_echo *echo,
-		     size_t len)
+static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
+		     size_t len, uint16_t seqn)
 {
+	echo->header.un.echo.sequence = htons(seqn);
+
+	size_t pad_offset = 0;
+	if (ctx->add_time) {
+		if (gettimeofday((struct timeval *)echo->data, NULL)) {
+			ping_perror("gettimeofday");
+			return 1;
+		}
+		pad_offset += sizeof(struct timeval);
+	}
+
+	if (pad_offset < ctx->datalen)
+		memset(echo->data + pad_offset, ctx->padding, ctx->datalen - pad_offset);
+
 	ssize_t nsent =
 		sendto(ctx->sockfd, echo, len, 0, ctx->addr, ctx->addrlen);
 	if (nsent < 0) {
@@ -179,7 +191,7 @@ static void main_loop(struct ping_ctx *ctx)
 	const size_t buflen = sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
 	struct icmp_echo *buf = malloc(buflen); //TODO calloc
 
-	uint16_t seqn = 0;
+	uint16_t seqn = -1;
 	struct icmp_echo *echo = malloc(buflen); //TODO calloc
 	echo->header.type = ICMP_ECHO;
 	echo->header.code = 0;
@@ -187,22 +199,13 @@ static void main_loop(struct ping_ctx *ctx)
 	echo->header.un.echo.id = 0;
 
 	for (;;) {
-		echo->header.un.echo.sequence = htons(seqn);
+		++seqn;
 
-		if (ctx->add_time) {
-			if (gettimeofday((struct timeval*) echo->data, NULL)) {
-				ping_perror("gettimeofday");
-				continue;
-			}
-		}
-
-		int rc = send_echo(ctx, echo, buflen);
-
+		int rc = send_echo(ctx, echo, buflen, seqn);
 		if (rc)
 			continue;
 
 		int ttl = 0;
-
 		struct sockaddr_in from;
 		memset(&from, 0, sizeof(from));
 
@@ -214,7 +217,6 @@ static void main_loop(struct ping_ctx *ctx)
 		print_ping(ctx, buf, ttl, &from);
 
 		usleep(ctx->interval * 1000);
-		++seqn;
 	}
 	free(buf);
 	free(echo);
