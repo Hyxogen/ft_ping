@@ -2,6 +2,7 @@
 #include <sys/socket.h>
 #include <stdio.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <netdb.h>
 #include <netinet/ip_icmp.h>
 #include <assert.h>
@@ -20,7 +21,10 @@ struct icmp_echo {
 
 struct ping_ctx {
 	int sockfd;
-	struct sockaddr_in addr;
+	struct sockaddr *addr;
+	size_t datalen;
+	unsigned char padding;
+	socklen_t addrlen;
 	useconds_t interval;
 };
 
@@ -63,7 +67,8 @@ static uint16_t inet_checksum(const void *src, size_t len)
 	return (uint16_t)~sum;
 }
 
-static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen, int *ttl, void *addr, size_t addrlen)
+static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
+			  int *ttl, void *addr, size_t addrlen)
 {
 	struct iovec iov;
 	iov.iov_base = dest;
@@ -117,17 +122,17 @@ static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen, in
 	return 0;
 }
 
-static int send_echo(const struct ping_ctx *ctx, const struct icmp_echo *echo, size_t len)
+static int send_echo(const struct ping_ctx *ctx, const struct icmp_echo *echo,
+		     size_t len)
 {
-	ssize_t nsent = sendto(ctx->sockfd, echo, len, 0,
-			       (const struct sockaddr *)&ctx->addr,
-			       sizeof(ctx->addr));
+	ssize_t nsent =
+		sendto(ctx->sockfd, echo, len, 0, ctx->addr, ctx->addrlen);
 	if (nsent < 0) {
 		ping_perror("sendto");
 		return 1;
 	}
 
-	if ((unsigned long long) nsent < len) {
+	if ((unsigned long long)nsent < len) {
 		ping_error("sendto: unexpected shortcount\n");
 		return 1;
 	}
@@ -137,7 +142,7 @@ static int send_echo(const struct ping_ctx *ctx, const struct icmp_echo *echo, s
 
 static void main_loop(struct ping_ctx *ctx)
 {
-	const size_t buflen = sizeof(struct icmp_echo); //TODO + body size
+	const size_t buflen = sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
 	struct icmp_echo *buf = malloc(buflen); //TODO calloc
 
 	uint16_t seqn = 0;
@@ -147,8 +152,17 @@ static void main_loop(struct ping_ctx *ctx)
 	echo->header.checksum = 0;
 	echo->header.un.echo.id = 0;
 
+	int add_time = ctx->datalen > sizeof(struct timeval);
+
 	for (;;) {
 		echo->header.un.echo.sequence = htons(seqn);
+
+		if (add_time) {
+			if (gettimeofday((struct timeval*) echo->data, NULL)) {
+				ping_perror("gettimeofday");
+				continue;
+			}
+		}
 
 		int rc = send_echo(ctx, echo, buflen);
 
@@ -160,9 +174,15 @@ static void main_loop(struct ping_ctx *ctx)
 		struct sockaddr_in from;
 		memset(&from, 0, sizeof(from));
 
-		rc = recv_reply(ctx->sockfd, buf, buflen, &ttl, &from, sizeof(from));
+		rc = recv_reply(ctx->sockfd, buf, buflen, &ttl, &from,
+				sizeof(from));
 		if (rc)
 			continue;
+		struct timeval now;
+		if (gettimeofday(&now, NULL)) {
+			ping_perror("gettimeofday");
+			continue;
+		}
 
 		char addr[INET_ADDRSTRLEN];
 		if (!inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr))) {
@@ -170,9 +190,16 @@ static void main_loop(struct ping_ctx *ctx)
 			continue;
 		}
 
-		fprintf(stdout,
-			"%zu bytes from %s: icmp_seq=%hu ttl=%i time=%llu ms\n",
-			buflen, addr, seqn, ttl, 0llu);
+		fprintf(stdout, "%zu bytes from %s: icmp_seq=%hu ttl=%i",
+			buflen, addr, ntohs(buf->header.un.echo.sequence), ttl);
+
+		if (add_time) {
+			struct timeval *sent = (struct timeval*) buf->data;
+			float ms = (now.tv_sec - sent->tv_sec) * 1000.0f +
+				   (now.tv_usec - sent->tv_usec) / 1000.0f;
+			fprintf(stdout, " time=%.3f ms", ms);
+		}
+		fprintf(stdout, "\n");
 		usleep(ctx->interval * 1000);
 		++seqn;
 	}
@@ -192,7 +219,6 @@ int main(int argc, char **argv)
 	struct addrinfo hints, *res;
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
-	hints.ai_family = AF_UNSPEC;
 	hints.ai_protocol = IPPROTO_ICMP;
 
 	int rc = getaddrinfo(argv[1], NULL, &hints, &res);
@@ -208,14 +234,26 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	ctx.addr = *(struct sockaddr_in *)res->ai_addr;
-	ctx.addr.sin_family = AF_INET;
-	ctx.addr.sin_port = ((struct sockaddr_in *)res->ai_addr)->sin_port;
-	ctx.addr.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+
+	ctx.addr = res->ai_addr;
+	ctx.addrlen = res->ai_addrlen;
+	ctx.datalen = 56;
+	ctx.padding = 0x00;
 
 	ctx.interval = 1000;
 
+	struct timeval timeout = {
+		.tv_sec = 1,
+		.tv_usec = 0,
+	};
+
+	if (setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) {
+		ping_perror("setsockopt");
+		return EXIT_FAILURE;
+	}
+
 	main_loop(&ctx);
+	freeaddrinfo(res);
 	return EXIT_SUCCESS;
 }
 
