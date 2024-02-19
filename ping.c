@@ -139,7 +139,8 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 	}
 
 	if (pad_offset < ctx->datalen)
-		memset(echo->data + pad_offset, ctx->padding, ctx->datalen - pad_offset);
+		memset(echo->data + pad_offset, ctx->padding,
+		       ctx->datalen - pad_offset);
 
 	ssize_t nsent =
 		sendto(ctx->sockfd, echo, len, 0, ctx->addr, ctx->addrlen);
@@ -173,8 +174,8 @@ static int print_ping(const struct ping_ctx *ctx, const struct icmp_echo *reply,
 	}
 
 	printf("%zu bytes from %s: icmp_seq=%hu ttl=%i",
-		ctx->datalen + sizeof(struct icmphdr), addr,
-		ntohs(reply->header.un.echo.sequence), ttl);
+	       ctx->datalen + sizeof(struct icmphdr), addr,
+	       ntohs(reply->header.un.echo.sequence), ttl);
 
 	if (ctx->add_time) {
 		struct timeval *sent = (struct timeval *)reply->data;
@@ -188,7 +189,8 @@ static int print_ping(const struct ping_ctx *ctx, const struct icmp_echo *reply,
 
 static void main_loop(struct ping_ctx *ctx)
 {
-	const size_t buflen = sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
+	const size_t buflen =
+		sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
 	struct icmp_echo *buf = malloc(buflen); //TODO calloc
 
 	uint16_t seqn = -1;
@@ -249,7 +251,6 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-
 	ctx.addr = res->ai_addr;
 	ctx.addrlen = res->ai_addrlen;
 	ctx.datalen = 56;
@@ -262,7 +263,8 @@ int main(int argc, char **argv)
 		.tv_usec = 0,
 	};
 
-	if (setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) {
+	if (setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+		       sizeof(timeout))) {
 		ping_perror("setsockopt");
 		return EXIT_FAILURE;
 	}
