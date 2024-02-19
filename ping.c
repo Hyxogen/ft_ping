@@ -11,7 +11,7 @@
 #include <arpa/inet.h>
 #include <stdarg.h>
 
-static const char *program_name = NULL;
+#define MAX_BODY_SIZE 128
 
 struct icmp_echo {
 	struct icmphdr header;
@@ -21,10 +21,10 @@ struct icmp_echo {
 struct ping_ctx {
 	int sockfd;
 	struct sockaddr_in addr;
-	struct icmp_echo base;
-	size_t baselen;
 	useconds_t interval;
 };
+
+static const char *program_name = NULL;
 
 __attribute__((format(printf, 1, 2))) static void ping_error(const char *fmt,
 							     ...)
@@ -63,71 +63,121 @@ static uint16_t inet_checksum(const void *src, size_t len)
 	return (uint16_t)~sum;
 }
 
-static int do_ping(const struct ping_ctx *ctx)
+static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen, int *ttl, void *addr, size_t addrlen)
 {
-	ssize_t nsent = sendto(ctx->sockfd, &ctx->base, ctx->baselen, 0,
+	struct iovec iov;
+	iov.iov_base = dest;
+	iov.iov_len = destlen;
+
+	char cbuf[512];
+	struct msghdr msg = {
+		.msg_name = addr,
+		.msg_namelen = addrlen,
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+		.msg_flags = 0,
+	};
+
+	ssize_t nread = recvmsg(sockfd, &msg, 0);
+	if (nread < 0) {
+		ping_perror("recvmsg");
+		return -1;
+	}
+
+	if ((size_t)nread < destlen) {
+		ping_error("recvmsg: unexpected shortcount\n");
+		return -1;
+	}
+
+	if (msg.msg_flags & MSG_TRUNC) {
+		ping_error("recvmsg: unexpectedly large message\n");
+		return -1;
+	}
+
+	if (dest->header.type != ICMP_ECHOREPLY) {
+		ping_error("received unexpected icmp type\n");
+		return -1;
+	}
+	if (dest->header.code) {
+		ping_error("received unexpected icmp reply code\n");
+		return -1;
+	}
+
+	uint16_t check = inet_checksum(dest, destlen);
+	if (check) {
+		ping_error("icmp checksum invalid\n");
+		return -1;
+	}
+
+	assert(ttl);
+	*ttl = 0; //TODO set
+
+	return 0;
+}
+
+static int send_echo(const struct ping_ctx *ctx, const struct icmp_echo *echo, size_t len)
+{
+	ssize_t nsent = sendto(ctx->sockfd, echo, len, 0,
 			       (const struct sockaddr *)&ctx->addr,
 			       sizeof(ctx->addr));
 	if (nsent < 0) {
 		ping_perror("sendto");
 		return 1;
 	}
-	if ((unsigned long long)nsent < ctx->baselen) {
-		ping_error("sendto: unexpeced shortcount\n");
+
+	if ((unsigned long long) nsent < len) {
+		ping_error("sendto: unexpected shortcount\n");
 		return 1;
 	}
 
-	struct icmp_echo *resp = malloc(sizeof(resp) + 128);
-	struct iovec iov;
-	iov.iov_base = resp;
-	iov.iov_len = sizeof(resp) + 128;
-	memset(resp, 0, iov.iov_len);
-
-	char name[128];
-	char cbuf[512];
-	struct msghdr msg;
-
-	msg.msg_name = name;
-	msg.msg_namelen = sizeof(name);
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_control = cbuf;
-	msg.msg_controllen = sizeof(cbuf);
-	msg.msg_flags = 0;
-
-	ssize_t nread = recvmsg(ctx->sockfd, &msg, 0);
-	if (nread < 0) {
-		ping_perror("recvmsg");
-		return 1;
-	}
-
-	char from[1024];
-	const char *tmp =
-		inet_ntop(AF_INET, &ctx->addr.sin_addr, from, sizeof(from));
-	if (!tmp) {
-		ping_perror("inet_ntop");
-		return 1;
-	}
-
-	if (resp->header.type != ICMP_ECHOREPLY) {
-		fprintf(stderr, "not an echo reply, %hhu\n", resp->header.type);
-	}
-
-	uint16_t ch = inet_checksum(resp, nread);
-
-	if (ch) {
-		uint16_t *s = (uint16_t *)resp;
-		for (int i = 0; i < nread; i += 2) {
-			printf("%04hx ", s[i]);
-		}
-		printf("\n");
-		fprintf(stderr,
-			"invalid checksum, packet said: %hx, we got %hx\n",
-			resp->header.checksum, ch);
-	}
-
-	fprintf(stdout, "%u bytes from %s \n", (unsigned)nread, tmp);
 	return 0;
+}
+
+static void main_loop(struct ping_ctx *ctx)
+{
+	const size_t buflen = sizeof(struct icmp_echo); //TODO + body size
+	struct icmp_echo *buf = malloc(buflen); //TODO calloc
+
+	uint16_t seqn = 0;
+	struct icmp_echo *echo = malloc(buflen); //TODO calloc
+	echo->header.type = ICMP_ECHO;
+	echo->header.code = 0;
+	echo->header.checksum = 0;
+	echo->header.un.echo.id = 0;
+
+	for (;;) {
+		echo->header.un.echo.sequence = htons(seqn);
+
+		int rc = send_echo(ctx, echo, buflen);
+
+		if (rc)
+			continue;
+
+		int ttl = 0;
+
+		struct sockaddr_in from;
+		memset(&from, 0, sizeof(from));
+
+		rc = recv_reply(ctx->sockfd, buf, buflen, &ttl, &from, sizeof(from));
+		if (rc)
+			continue;
+
+		char addr[INET_ADDRSTRLEN];
+		if (!inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr))) {
+			ping_perror("inet_ntop");
+			continue;
+		}
+
+		fprintf(stdout,
+			"%zu bytes from %s: icmp_seq=%hu ttl=%i time=%llu ms\n",
+			buflen, addr, seqn, ttl, 0llu);
+		usleep(ctx->interval * 1000);
+		++seqn;
+	}
+	free(buf);
+	free(echo);
 }
 
 #ifndef TEST
@@ -141,7 +191,7 @@ int main(int argc, char **argv)
 
 	struct addrinfo hints, *res;
 	memset(&hints, 0, sizeof(hints));
-	//hints.ai_family = AF_INET;
+	hints.ai_family = AF_INET;
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_protocol = IPPROTO_ICMP;
 
@@ -163,21 +213,9 @@ int main(int argc, char **argv)
 	ctx.addr.sin_port = ((struct sockaddr_in *)res->ai_addr)->sin_port;
 	ctx.addr.sin_addr = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
 
-	ctx.base.header.type = ICMP_ECHO;
-	ctx.base.header.code = 0;
-	ctx.base.header.checksum = 0;
-	ctx.base.header.un.echo.id = 1234;
-	ctx.base.header.un.echo.sequence = 0;
-	ctx.baselen = sizeof(ctx.base);
-
-	ctx.base.header.checksum = inet_checksum(&ctx, ctx.baselen);
-
 	ctx.interval = 1000;
 
-	for (;;) {
-		do_ping(&ctx);
-		usleep(ctx.interval * 1000);
-	}
+	main_loop(&ctx);
 	return EXIT_SUCCESS;
 }
 
