@@ -75,7 +75,8 @@ static uint16_t inet_checksum(const void *src, size_t len)
 }
 
 static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
-			  int *ttl, void *addr, size_t addrlen, struct timeval *ts)
+			  int *ttl, void *addr, size_t addrlen,
+			  struct timeval *ts)
 {
 	struct iovec iov;
 	iov.iov_base = dest;
@@ -131,7 +132,8 @@ static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
 		if (cmsg->cmsg_level == IPPROTO_IP &&
 		    cmsg->cmsg_type == IP_TTL) {
 			memcpy(ttl, CMSG_DATA(cmsg), sizeof(*ttl));
-		} else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMP) {
+		} else if (cmsg->cmsg_level == SOL_SOCKET &&
+			   cmsg->cmsg_type == SCM_TIMESTAMP) {
 			memcpy(ts, CMSG_DATA(cmsg), sizeof(*ts));
 		}
 		cmsg = CMSG_NXTHDR(&msg, cmsg);
@@ -174,11 +176,13 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 }
 
 static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
-		      int ttl, const struct sockaddr_in *from, const struct timeval *ts)
+		      int ttl, const struct sockaddr_in *from,
+		      const struct timeval *ts)
 {
 	if (!ctx->force_numeric && !ctx->has_name) {
 		//TODO NDI format conversion
-		if (getnameinfo((const struct sockaddr*)from, sizeof(*from), ctx->name, sizeof(ctx->name), NULL, 0, 0))
+		if (getnameinfo((const struct sockaddr *)from, sizeof(*from),
+				ctx->name, sizeof(ctx->name), NULL, 0, 0))
 			ctx->force_numeric = 1;
 		else
 			ctx->has_name = 1;
@@ -200,7 +204,8 @@ static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 	if (print_name)
 		printf(")");
 
-	printf(": icmp_seq=%hu ttl=%i", ntohs(reply->header.un.echo.sequence), ttl);
+	printf(": icmp_seq=%hu ttl=%i", ntohs(reply->header.un.echo.sequence),
+	       ttl);
 
 	if (ctx->add_time) {
 		struct timeval *sent = (struct timeval *)reply->data;

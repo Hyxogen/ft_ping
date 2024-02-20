@@ -31,5 +31,8 @@ re:
 	${MAKE} fclean
 	${MAKE}
 
-.PHONY: all clean fclean re check
+fmt:
+	clang-format -i $(SRC_FILES)
+
+.PHONY: all clean fclean re check format
 -include $(DEP_FILES)
