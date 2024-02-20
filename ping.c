@@ -32,6 +32,8 @@ struct ping_ctx {
 	char name[256];
 	int has_name;
 
+	char addrstr[INET_ADDRSTRLEN];
+
 	useconds_t interval;
 };
 
@@ -188,19 +190,13 @@ static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 			ctx->has_name = 1;
 	}
 
-	char addr[INET_ADDRSTRLEN];
-	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
-		ping_perror("inet_ntop");
-		return 1;
-	}
-
 	printf("%zu bytes from ", ctx->datalen + sizeof(struct icmphdr));
 
 	int print_name = !ctx->force_numeric && ctx->has_name;
 
 	if (print_name)
 		printf("%s (", ctx->name);
-	printf("%s", addr);
+	printf("%s", ctx->addrstr);
 	if (print_name)
 		printf(")");
 
@@ -301,6 +297,13 @@ int main(int argc, char **argv)
 
 	ctx.add_time = ctx.datalen > sizeof(struct timeval);
 
+	if (!inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr,
+		       ctx.addrstr, sizeof(ctx.addrstr))) {
+		ping_perror("inet_ntop");
+		return EXIT_FAILURE;
+	}
+
+	printf("PING %s (%s): %zu data bytes\n", argv[1], ctx.addrstr, ctx.datalen);
 	main_loop(&ctx);
 	freeaddrinfo(res);
 	return EXIT_SUCCESS;
