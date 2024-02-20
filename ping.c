@@ -27,6 +27,11 @@ struct ping_ctx {
 	unsigned char padding;
 	int add_time;
 
+	int force_numeric;
+
+	char name[256];
+	int has_name;
+
 	useconds_t interval;
 };
 
@@ -168,18 +173,34 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 	return 0;
 }
 
-static int print_ping(const struct ping_ctx *ctx, const struct icmp_echo *reply,
+static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 		      int ttl, const struct sockaddr_in *from, const struct timeval *ts)
 {
+	if (!ctx->force_numeric && !ctx->has_name) {
+		//TODO NDI format conversion
+		if (getnameinfo((const struct sockaddr*)from, sizeof(*from), ctx->name, sizeof(ctx->name), NULL, 0, 0))
+			ctx->force_numeric = 1;
+		else
+			ctx->has_name = 1;
+	}
+
 	char addr[INET_ADDRSTRLEN];
 	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
 		ping_perror("inet_ntop");
 		return 1;
 	}
 
-	printf("%zu bytes from %s: icmp_seq=%hu ttl=%i",
-	       ctx->datalen + sizeof(struct icmphdr), addr,
-	       ntohs(reply->header.un.echo.sequence), ttl);
+	printf("%zu bytes from ", ctx->datalen + sizeof(struct icmphdr));
+
+	int print_name = !ctx->force_numeric && ctx->has_name;
+
+	if (print_name)
+		printf("%s (", ctx->name);
+	printf("%s", addr);
+	if (print_name)
+		printf(")");
+
+	printf(": icmp_seq=%hu ttl=%i", ntohs(reply->header.un.echo.sequence), ttl);
 
 	if (ctx->add_time) {
 		struct timeval *sent = (struct timeval *)reply->data;
@@ -260,6 +281,8 @@ int main(int argc, char **argv)
 	ctx.addrlen = res->ai_addrlen;
 	ctx.datalen = 56;
 	ctx.padding = 0x00;
+	ctx.force_numeric = 0;
+	ctx.has_name = 0;
 
 	ctx.interval = 1000;
 
