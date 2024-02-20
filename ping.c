@@ -70,7 +70,7 @@ static uint16_t inet_checksum(const void *src, size_t len)
 }
 
 static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
-			  int *ttl, void *addr, size_t addrlen)
+			  int *ttl, void *addr, size_t addrlen, struct timeval *ts)
 {
 	struct iovec iov;
 	iov.iov_base = dest;
@@ -119,7 +119,6 @@ static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
 	}
 
 	assert(ttl);
-
 	*ttl = 0;
 
 	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
@@ -127,7 +126,8 @@ static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
 		if (cmsg->cmsg_level == IPPROTO_IP &&
 		    cmsg->cmsg_type == IP_TTL) {
 			memcpy(ttl, CMSG_DATA(cmsg), sizeof(*ttl));
-			break;
+		} else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMP) {
+			memcpy(ts, CMSG_DATA(cmsg), sizeof(*ts));
 		}
 		cmsg = CMSG_NXTHDR(&msg, cmsg);
 	}
@@ -169,15 +169,8 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 }
 
 static int print_ping(const struct ping_ctx *ctx, const struct icmp_echo *reply,
-		      int ttl, const struct sockaddr_in *from)
+		      int ttl, const struct sockaddr_in *from, const struct timeval *ts)
 {
-	struct timeval now;
-
-	if (gettimeofday(&now, NULL)) {
-		ping_perror("gettimeofday");
-		return 1;
-	}
-
 	char addr[INET_ADDRSTRLEN];
 	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
 		ping_perror("inet_ntop");
@@ -190,8 +183,8 @@ static int print_ping(const struct ping_ctx *ctx, const struct icmp_echo *reply,
 
 	if (ctx->add_time) {
 		struct timeval *sent = (struct timeval *)reply->data;
-		float ms = (now.tv_sec - sent->tv_sec) * 1000.0f +
-			   (now.tv_usec - sent->tv_usec) / 1000.0f;
+		float ms = (ts->tv_sec - sent->tv_sec) * 1000.0f +
+			   (ts->tv_usec - sent->tv_usec) / 1000.0f;
 		printf(" time=%.3f ms", ms);
 	}
 	printf("\n");
@@ -220,14 +213,15 @@ static void main_loop(struct ping_ctx *ctx)
 
 		int ttl = 0;
 		struct sockaddr_in from;
+		struct timeval ts;
 		memset(&from, 0, sizeof(from));
 
 		rc = recv_reply(ctx->sockfd, buf, buflen, &ttl, &from,
-				sizeof(from));
+				sizeof(from), &ts);
 		if (rc)
 			continue;
 
-		print_ping(ctx, buf, ttl, &from);
+		print_ping(ctx, buf, ttl, &from, &ts);
 
 		usleep(ctx->interval * 1000);
 	}
@@ -270,7 +264,9 @@ int main(int argc, char **argv)
 	ctx.interval = 1000;
 
 	int yes = 1;
-	if (setsockopt(ctx.sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes))) {
+	if (setsockopt(ctx.sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
+	    setsockopt(ctx.sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
+		       sizeof(yes))) {
 		ping_perror("setsockopt");
 		return EXIT_FAILURE;
 	}
