@@ -1,3 +1,5 @@
+#include <ft/getopt.h>
+#include <ft/stdlib.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <stdio.h>
@@ -11,6 +13,7 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <stdarg.h>
+#include <limits.h>
 
 struct icmp_echo {
 	struct icmphdr header;
@@ -19,6 +22,8 @@ struct icmp_echo {
 
 struct ping_ctx {
 	int sockfd;
+
+	const char *host;
 
 	struct sockaddr *addr;
 	socklen_t addrlen;
@@ -34,18 +39,43 @@ struct ping_ctx {
 
 	char addrstr[INET_ADDRSTRLEN];
 
+	unsigned long long ntransmit;
+	unsigned long long nreceive;
+
+	int verbose;
+	int flood;
+	int linger;
+	int timeout;
+	uint16_t preload;
+	uint16_t ping_cnt;
+
 	useconds_t interval;
 };
 
 static const char *program_name = NULL;
+
+static void ping_verror(const char *fmt, va_list ap)
+{
+	fprintf(stderr, "%s: ", program_name);
+	vfprintf(stderr, fmt, ap);
+}
 
 __attribute__((format(printf, 1, 2))) static void ping_error(const char *fmt,
 							     ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	fprintf(stderr, "%s: ", program_name);
-	vfprintf(stderr, fmt, ap);
+	ping_verror(fmt, ap);
+	va_end(ap);
+}
+
+__attribute__((format(printf, 1, 2))) static void ping_error_and_exit(const char *fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	ping_verror(fmt, ap);
+	va_end(ap);
+	exit(EXIT_FAILURE);
 }
 
 static void ping_perror(const char *s)
@@ -55,6 +85,17 @@ static void ping_perror(const char *s)
 		ping_error("%s: %s\n", s, err);
 	else
 		ping_error("%s\n", err);
+}
+
+static long parse_long_or_err(const char *src, int base, long min, long max)
+{
+	char *end;
+	long res = ft_strtol(src, &end, base);
+	if (*end)
+		ping_error_and_exit("invalid value: '%s'\n", src);
+	if (res < min || res > max)
+		ping_error_and_exit("value too large: '%s'\n", src);
+	return res;
 }
 
 static uint16_t inet_checksum(const void *src, size_t len)
@@ -68,11 +109,10 @@ static uint16_t inet_checksum(const void *src, size_t len)
 		len -= 2;
 	}
 	if (len)
-		sum += (uint16_t) * (uint8_t *)s << 8;
+		sum += (uint16_t)(*(uint8_t *)s) << 8;
 
-	while (sum & ~0xFFFF) {
+	while (sum & ~0xFFFF)
 		sum = (sum & 0xFFFF) + (sum >> 16);
-	}
 	return (uint16_t)~sum;
 }
 
@@ -181,6 +221,12 @@ static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 		      int ttl, const struct sockaddr_in *from,
 		      const struct timeval *ts)
 {
+	char addr[INET_ADDRSTRLEN];
+	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
+		ping_perror("inet_ntop");
+		return EXIT_FAILURE;
+	}
+
 	if (!ctx->force_numeric && !ctx->has_name) {
 		//TODO NDI format conversion
 		if (getnameinfo((const struct sockaddr *)from, sizeof(*from),
@@ -196,7 +242,7 @@ static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 
 	if (print_name)
 		printf("%s (", ctx->name);
-	printf("%s", ctx->addrstr);
+	printf("%s", addr);
 	if (print_name)
 		printf(")");
 
@@ -232,6 +278,7 @@ static void main_loop(struct ping_ctx *ctx)
 		int rc = send_echo(ctx, echo, buflen, seqn);
 		if (rc)
 			continue;
+		ctx->ntransmit += 1;
 
 		int ttl = 0;
 		struct sockaddr_in from;
@@ -242,6 +289,7 @@ static void main_loop(struct ping_ctx *ctx)
 				sizeof(from), &ts);
 		if (rc)
 			continue;
+		ctx->nreceive += 1;
 
 		print_ping(ctx, buf, ttl, &from, &ts);
 
@@ -251,27 +299,90 @@ static void main_loop(struct ping_ctx *ctx)
 	free(echo);
 }
 
+static void print_stats(const struct ping_ctx *ctx)
+{
+	printf("--- %s ping statistics ---\n", ctx->host);
+	printf("%llu packets transmitted, %llu packets received, %f packet loss\n",
+	       ctx->ntransmit, ctx->nreceive,
+	       ctx->nreceive * 100.0f / ctx->ntransmit);
+
+	if (ctx->add_time) {
+		printf("roundtrip min/avg/max/stddev = %f/%f/%f/%f ms\n", 0.0,
+		       0.0, 0.0, 0.0);
+	}
+}
+
+static void parse_options(int argc, char **argv, struct ping_ctx *ctx)
+{
+	struct option longopts[] = {
+		{ "count", required_argument, NULL, 0 },
+		{ "verbose", 0, NULL, 1 },
+		{ "flood", 0, NULL, 2 },
+		{ "preload", required_argument, NULL, 3 },
+		{ "timeout", required_argument, NULL, 4 },
+		{ "linger", required_argument, NULL, 4 },
+		{ NULL, 0, NULL, 0},
+	};
+
+	int c;
+	ft_opterr = 1;
+	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:", longopts, NULL)) != -1) {
+		switch (c) {
+		case 'c':
+		case 0:
+			ctx->ping_cnt = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			break;
+		case 'v':
+		case 1:
+			ctx->verbose = 1;
+			break;
+		case 'f':
+		case 2:
+			ctx->flood = 1;
+			break;
+		case 'l':
+		case 3:
+			ctx->preload = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			break;
+		case 'w':
+		case 4:
+			ctx->timeout = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			break;
+		case 'W':
+		case 5:
+			ctx->linger = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+		}
+	}
+	if (ft_optind >= argc)
+		ping_error_and_exit("destination address required\n");
+	ctx->host = argv[ft_optind];
+}
+
 #ifndef TEST
 int main(int argc, char **argv)
 {
 	program_name = argv[0];
-	if (argc < 2) {
-		ping_error("destination address required\n");
-		return EXIT_SUCCESS;
-	}
+
+	struct ping_ctx ctx = {
+		.datalen = 56,
+		.padding = 0x00,
+		.force_numeric = 0,
+		.has_name = 0,
+		.interval = 1000,
+	};
+	parse_options(argc, argv, &ctx);
 
 	struct addrinfo hints, *res;
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_protocol = IPPROTO_ICMP;
 
-	int rc = getaddrinfo(argv[1], NULL, &hints, &res);
+	int rc = getaddrinfo(ctx.host, NULL, &hints, &res);
 	if (rc < 0) {
 		ping_error("getaddrinfo: %s\n", gai_strerror(rc));
 		return EXIT_FAILURE;
 	}
 
-	struct ping_ctx ctx;
 	ctx.sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
 	if (ctx.sockfd < 0) {
 		ping_perror("socket");
@@ -280,12 +391,6 @@ int main(int argc, char **argv)
 
 	ctx.addr = res->ai_addr;
 	ctx.addrlen = res->ai_addrlen;
-	ctx.datalen = 56;
-	ctx.padding = 0x00;
-	ctx.force_numeric = 0;
-	ctx.has_name = 0;
-
-	ctx.interval = 1000;
 
 	int yes = 1;
 	if (setsockopt(ctx.sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
@@ -303,8 +408,9 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	printf("PING %s (%s): %zu data bytes\n", argv[1], ctx.addrstr, ctx.datalen);
+	printf("PING %s (%s): %zu data bytes\n", ctx.host, ctx.addrstr, ctx.datalen);
 	main_loop(&ctx);
+	print_stats(&ctx); //TODO actually print stats
 	freeaddrinfo(res);
 	return EXIT_SUCCESS;
 }
