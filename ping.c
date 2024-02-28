@@ -26,8 +26,7 @@ struct ping_ctx {
 
 	const char *host;
 
-	struct sockaddr *addr;
-	socklen_t addrlen;
+	struct sockaddr_in addr;
 
 	size_t datalen;
 	unsigned char padding;
@@ -48,13 +47,14 @@ struct ping_ctx {
 	int linger;
 	int timeout;
 	uint16_t preload;
-	uint16_t ping_cnt;
+	uint32_t ping_cnt;
 
 	useconds_t interval;
 
 	float min_rtt;
 	float max_rtt;
 	float avg_rtt;
+	float var_rtt;
 };
 
 static const char *program_name = NULL;
@@ -91,6 +91,12 @@ static void ping_perror(const char *s)
 		ping_error("%s: %s\n", s, err);
 	else
 		ping_error("%s\n", err);
+}
+
+static void ping_perror_and_exit(const char *s)
+{
+	ping_perror(s);
+	exit(EXIT_FAILURE);
 }
 
 static long parse_long_or_err(const char *src, int base, long min, long max)
@@ -210,8 +216,9 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 		memset(echo->data + pad_offset, ctx->padding,
 		       ctx->datalen - pad_offset);
 
-	ssize_t nsent =
-		sendto(ctx->sockfd, echo, len, 0, ctx->addr, ctx->addrlen);
+	ssize_t nsent = sendto(ctx->sockfd, echo, len, 0,
+			       (const struct sockaddr *)&ctx->addr,
+			       sizeof(ctx->addr));
 	if (nsent < 0) {
 		ping_perror("sendto");
 		return 1;
@@ -225,7 +232,7 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 	return 0;
 }
 
-static float ms_elapsed(struct timeval start, struct timeval end)
+static float millis_elapsed(struct timeval start, struct timeval end)
 {
 	return (end.tv_sec - start.tv_sec) * 1000.0f +
 	       (end.tv_usec - start.tv_usec) / 1000.0f;
@@ -268,14 +275,54 @@ static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 	return 0;
 }
 
+static float simple_sqrt(float f)
+{
+	double res = f/2.0;
+	for (int i = 0; i < 100; ++i)
+		res = (res + f / res) / 2.0;
+	return res;
+}
+
+//https://en.wikipedia.org/w/index.php?title=Algorithms_for_calculating_variance&oldid=1198125194#Welford's_online_algorithm
+static float update_stats(struct ping_ctx *ctx, const struct icmp_echo *reply,
+			 const struct timeval *ts)
+{
+	float rtt = 0.0f;
+	if (ctx->add_time) {
+		struct timeval sent;
+		memcpy(&sent, reply->data, sizeof(sent));
+		rtt = millis_elapsed(sent, *ts);
+
+		ctx->min_rtt = ft_fminf(ctx->min_rtt, rtt);
+		ctx->max_rtt = ft_fmaxf(ctx->min_rtt, rtt);
+
+		float old_avg = ctx->avg_rtt;
+
+		ctx->avg_rtt = (rtt + ctx->nreceive * ctx->avg_rtt) /
+			       (ctx->nreceive + 1);
+
+		if (ctx->nreceive) {
+			ctx->var_rtt = ctx->var_rtt +
+				       ((rtt - old_avg) * (rtt - ctx->avg_rtt) -
+					ctx->var_rtt) /
+					       ctx->nreceive;
+		} else {
+			ctx->var_rtt =
+				(rtt - ctx->avg_rtt) * (rtt - ctx->avg_rtt);
+		}
+	}
+	ctx->nreceive += 1;
+	return rtt;
+}
+
 static void main_loop(struct ping_ctx *ctx)
 {
-	const size_t buflen =
+	const size_t len =
 		sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
-	struct icmp_echo *buf = malloc(buflen); //TODO calloc
+	struct icmp_echo *reply = malloc(len); //TODO calloc
 
 	uint16_t seqn = -1;
-	struct icmp_echo *echo = malloc(buflen); //TODO calloc
+	struct icmp_echo *echo = malloc(len); //TODO calloc
 	echo->header.type = ICMP_ECHO;
 	echo->header.code = 0;
 	echo->header.checksum = 0;
@@ -284,7 +331,7 @@ static void main_loop(struct ping_ctx *ctx)
 	for (;;) {
 		++seqn;
 
-		int rc = send_echo(ctx, echo, buflen, seqn);
+		int rc = send_echo(ctx, echo, len, seqn);
 		if (rc)
 			continue;
 		ctx->ntransmit += 1;
@@ -300,24 +347,11 @@ static void main_loop(struct ping_ctx *ctx)
 			continue;
 		}
 
-		rc = recv_reply(ctx->sockfd, buf, buflen, &ttl, &from,
+		rc = recv_reply(ctx->sockfd, reply, len, &ttl, &from,
 				sizeof(from), &ts);
 		if (!rc) {
-			float rtt = 0.0f;
-			if (ctx->add_time) {
-				struct timeval sent;
-				memcpy(&sent, buf->data, sizeof(sent));
-				rtt = ms_elapsed(sent, ts);
-
-				ctx->min_rtt = ft_fminf(ctx->min_rtt, rtt);
-				ctx->max_rtt = ft_fmaxf(ctx->min_rtt, rtt);
-				ctx->avg_rtt =
-					(rtt + ctx->nreceive * ctx->avg_rtt) /
-					(ctx->nreceive + 1);
-			}
-			print_ping(ctx, buf, ttl, &from, rtt);
-
-			ctx->nreceive += 1;
+			float rtt = update_stats(ctx, reply, &ts);
+			print_ping(ctx, reply, ttl, &from, rtt);
 		}
 
 		if (ctx->ntransmit >= ctx->ping_cnt)
@@ -337,7 +371,7 @@ static void main_loop(struct ping_ctx *ctx)
 				   (now.tv_usec - before.tv_usec);
 		usleep(sleep);
 	}
-	free(buf);
+	free(reply);
 	free(echo);
 }
 
@@ -350,7 +384,8 @@ static void print_stats(const struct ping_ctx *ctx)
 
 	if (ctx->add_time && ctx->nreceive) {
 		printf("roundtrip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
-		       ctx->min_rtt, ctx->avg_rtt, ctx->max_rtt, 0.0);
+		       ctx->min_rtt, ctx->avg_rtt, ctx->max_rtt,
+		       simple_sqrt(ctx->var_rtt));
 	}
 }
 
@@ -414,6 +449,44 @@ static void parse_options(int argc, char **argv, struct ping_ctx *ctx)
 	ctx->host = argv[ft_optind];
 }
 
+static void setup_socket(struct ping_ctx *ctx)
+{
+	struct addrinfo hints, *res;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_protocol = IPPROTO_ICMP;
+
+	int rc = getaddrinfo(ctx->host, NULL, &hints, &res);
+	if (rc < 0)
+		ping_error_and_exit("getaddrinfo: %s\n", gai_strerror(rc));
+	if (res->ai_addrlen != sizeof(ctx->addr))
+		ping_error_and_exit("this should never happen\n");
+
+	memcpy(&ctx->addr, res->ai_addr, sizeof(ctx->addr));
+	freeaddrinfo(res);
+
+	ctx->sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+	if (ctx->sockfd < 0)
+		ping_perror_and_exit("socket");
+
+	struct timeval timeout = {
+		.tv_sec = ctx->interval,
+		.tv_usec = 0,
+	};
+
+	int yes = 1;
+	if (setsockopt(ctx->sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
+	    setsockopt(ctx->sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
+		       sizeof(yes)) ||
+	    setsockopt(ctx->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+		       sizeof(timeout)))
+		ping_perror_and_exit("setsockopt");
+
+	if (!inet_ntop(AF_INET, &ctx->addr.sin_addr, ctx->addrstr,
+		       sizeof(ctx->addrstr)))
+		ping_perror_and_exit("inet_ntop");
+}
+
 #ifndef TEST
 int main(int argc, char **argv)
 {
@@ -427,57 +500,17 @@ int main(int argc, char **argv)
 		.interval = 1,
 		.min_rtt = HUGE_VALF,
 		.max_rtt = -HUGE_VALF,
+		.ping_cnt = UINT32_MAX,
 	};
 	parse_options(argc, argv, &ctx);
-
-	struct addrinfo hints, *res;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET;
-	hints.ai_protocol = IPPROTO_ICMP;
-
-	int rc = getaddrinfo(ctx.host, NULL, &hints, &res);
-	if (rc < 0) {
-		ping_error("getaddrinfo: %s\n", gai_strerror(rc));
-		return EXIT_FAILURE;
-	}
-
-	ctx.sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
-	if (ctx.sockfd < 0) {
-		ping_perror("socket");
-		return EXIT_FAILURE;
-	}
-
-	ctx.addr = res->ai_addr;
-	ctx.addrlen = res->ai_addrlen;
-
-	struct timeval timeout = {
-		.tv_sec = ctx.interval,
-		.tv_usec = 0,
-	};
-
-	int yes = 1;
-	if (setsockopt(ctx.sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
-	    setsockopt(ctx.sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
-		       sizeof(yes)) ||
-	    setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-		       sizeof(timeout))) {
-		ping_perror("setsockopt");
-		return EXIT_FAILURE;
-	}
-
 	ctx.add_time = ctx.datalen > sizeof(struct timeval);
 
-	if (!inet_ntop(AF_INET, &((struct sockaddr_in *)res->ai_addr)->sin_addr,
-		       ctx.addrstr, sizeof(ctx.addrstr))) {
-		ping_perror("inet_ntop");
-		return EXIT_FAILURE;
-	}
+	setup_socket(&ctx);
 
 	printf("PING %s (%s): %zu data bytes\n", ctx.host, ctx.addrstr,
 	       ctx.datalen);
 	main_loop(&ctx);
 	print_stats(&ctx); //TODO actually print stats
-	freeaddrinfo(res);
 	return EXIT_SUCCESS;
 }
 
