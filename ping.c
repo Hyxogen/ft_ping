@@ -15,11 +15,14 @@
 #include <arpa/inet.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <signal.h>
 
 struct icmp_echo {
 	struct icmphdr header;
 	unsigned char data[];
 };
+
+static volatile sig_atomic_t exit_now = 0;
 
 struct ping_ctx {
 	int sockfd;
@@ -328,7 +331,7 @@ static void main_loop(struct ping_ctx *ctx)
 	echo->header.checksum = 0;
 	echo->header.un.echo.id = 0;
 
-	for (;;) {
+	while (!exit_now) {
 		++seqn;
 
 		int rc = send_echo(ctx, echo, len, seqn);
@@ -364,7 +367,7 @@ static void main_loop(struct ping_ctx *ctx)
 		}
 
 		time_t diff = now.tv_sec - before.tv_sec;
-		if (diff >= ctx->interval)
+		if (diff >= ctx->interval || exit_now)
 			continue;
 
 		useconds_t sleep = (ctx->interval - diff) * 1000000 -
@@ -383,6 +386,7 @@ static void print_stats(const struct ping_ctx *ctx)
 	       (1.0f - ctx->nreceive / ctx->ntransmit) * 100.0f);
 
 	if (ctx->add_time && ctx->nreceive) {
+		//TODO fix nan in stddev when ./ft_ping localhost -c1
 		printf("roundtrip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
 		       ctx->min_rtt, ctx->avg_rtt, ctx->max_rtt,
 		       simple_sqrt(ctx->var_rtt));
@@ -487,6 +491,23 @@ static void setup_socket(struct ping_ctx *ctx)
 		ping_perror_and_exit("inet_ntop");
 }
 
+static void sighandler(int sig)
+{
+	(void)sig;
+	exit_now = 1;
+}
+
+static void setup_sighandlers()
+{
+	struct sigaction act = {
+		.sa_handler = sighandler,
+	};
+	if (sigemptyset(&act.sa_mask))
+		ping_perror_and_exit("sigemptyset");
+	if (sigaction(SIGINT, &act, NULL))
+		ping_perror("sigaction");
+}
+
 #ifndef TEST
 int main(int argc, char **argv)
 {
@@ -500,12 +521,15 @@ int main(int argc, char **argv)
 		.interval = 1,
 		.min_rtt = HUGE_VALF,
 		.max_rtt = -HUGE_VALF,
+		.avg_rtt = 0.0f,
+		.var_rtt = 0.0f,
 		.ping_cnt = UINT32_MAX,
 	};
 	parse_options(argc, argv, &ctx);
 	ctx.add_time = ctx.datalen > sizeof(struct timeval);
 
 	setup_socket(&ctx);
+	setup_sighandlers();
 
 	printf("PING %s (%s): %zu data bytes\n", ctx.host, ctx.addrstr,
 	       ctx.datalen);
