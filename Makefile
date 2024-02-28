@@ -60,9 +60,11 @@ $(OBJ_DIR)/%.o: %.c Makefile
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
+	${MAKE} -C $(LIBFT_DIR) clean
 	rm -rf $(OBJ_DIR)
 
 fclean:
+	${MAKE} -C $(LIBFT_DIR) fclean
 	${MAKE} clean
 	rm -f $(NAME)
 

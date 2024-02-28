@@ -1,5 +1,6 @@
 #include <ft/getopt.h>
 #include <ft/stdlib.h>
+#include <ft/math.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <stdio.h>
@@ -50,6 +51,10 @@ struct ping_ctx {
 	uint16_t ping_cnt;
 
 	useconds_t interval;
+
+	float min_rtt;
+	float max_rtt;
+	float avg_rtt;
 };
 
 static const char *program_name = NULL;
@@ -69,7 +74,8 @@ __attribute__((format(printf, 1, 2))) static void ping_error(const char *fmt,
 	va_end(ap);
 }
 
-__attribute__((format(printf, 1, 2))) static void ping_error_and_exit(const char *fmt, ...)
+__attribute__((format(printf, 1, 2))) static void
+ping_error_and_exit(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -93,7 +99,9 @@ static long parse_long_or_err(const char *src, int base, long min, long max)
 	long res = ft_strtol(src, &end, base);
 	if (*end)
 		ping_error_and_exit("invalid value: '%s'\n", src);
-	if (res < min || res > max)
+	if (res < min)
+		ping_error_and_exit("value too small: '%s'\n", src);
+	if (res > max)
 		ping_error_and_exit("value too large: '%s'\n", src);
 	return res;
 }
@@ -217,9 +225,14 @@ static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
 	return 0;
 }
 
+static float ms_elapsed(struct timeval start, struct timeval end)
+{
+	return (end.tv_sec - start.tv_sec) * 1000.0f +
+	       (end.tv_usec - start.tv_usec) / 1000.0f;
+}
+
 static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
-		      int ttl, const struct sockaddr_in *from,
-		      const struct timeval *ts)
+		      int ttl, const struct sockaddr_in *from, float rtt)
 {
 	char addr[INET_ADDRSTRLEN];
 	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
@@ -249,12 +262,8 @@ static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
 	printf(": icmp_seq=%hu ttl=%i", ntohs(reply->header.un.echo.sequence),
 	       ttl);
 
-	if (ctx->add_time) {
-		struct timeval *sent = (struct timeval *)reply->data;
-		float ms = (ts->tv_sec - sent->tv_sec) * 1000.0f +
-			   (ts->tv_usec - sent->tv_usec) / 1000.0f;
-		printf(" time=%.3f ms", ms);
-	}
+	if (ctx->add_time)
+		printf(" time=%.3f ms", rtt);
 	printf("\n");
 	return 0;
 }
@@ -285,15 +294,48 @@ static void main_loop(struct ping_ctx *ctx)
 		struct timeval ts;
 		memset(&from, 0, sizeof(from));
 
+		struct timeval before;
+		if (gettimeofday(&before, NULL)) {
+			ping_perror("gettimeofday");
+			continue;
+		}
+
 		rc = recv_reply(ctx->sockfd, buf, buflen, &ttl, &from,
 				sizeof(from), &ts);
-		if (rc)
+		if (!rc) {
+			float rtt = 0.0f;
+			if (ctx->add_time) {
+				struct timeval sent;
+				memcpy(&sent, buf->data, sizeof(sent));
+				rtt = ms_elapsed(sent, ts);
+
+				ctx->min_rtt = ft_fminf(ctx->min_rtt, rtt);
+				ctx->max_rtt = ft_fmaxf(ctx->min_rtt, rtt);
+				ctx->avg_rtt =
+					(rtt + ctx->nreceive * ctx->avg_rtt) /
+					(ctx->nreceive + 1);
+			}
+			print_ping(ctx, buf, ttl, &from, rtt);
+
+			ctx->nreceive += 1;
+		}
+
+		if (ctx->ntransmit >= ctx->ping_cnt)
+			break;
+
+		struct timeval now;
+		if (gettimeofday(&now, NULL)) {
+			ping_perror("gettimeofday");
 			continue;
-		ctx->nreceive += 1;
+		}
 
-		print_ping(ctx, buf, ttl, &from, &ts);
+		time_t diff = now.tv_sec - before.tv_sec;
+		if (diff >= ctx->interval)
+			continue;
 
-		usleep(ctx->interval * 1000);
+		useconds_t sleep = (ctx->interval - diff) * 1000000 -
+				   (now.tv_usec - before.tv_usec);
+		usleep(sleep);
 	}
 	free(buf);
 	free(echo);
@@ -302,13 +344,13 @@ static void main_loop(struct ping_ctx *ctx)
 static void print_stats(const struct ping_ctx *ctx)
 {
 	printf("--- %s ping statistics ---\n", ctx->host);
-	printf("%llu packets transmitted, %llu packets received, %f packet loss\n",
+	printf("%llu packets transmitted, %llu packets received, %.0f%% packet loss\n",
 	       ctx->ntransmit, ctx->nreceive,
-	       ctx->nreceive * 100.0f / ctx->ntransmit);
+	       (1.0f - ctx->nreceive / ctx->ntransmit) * 100.0f);
 
-	if (ctx->add_time) {
-		printf("roundtrip min/avg/max/stddev = %f/%f/%f/%f ms\n", 0.0,
-		       0.0, 0.0, 0.0);
+	if (ctx->add_time && ctx->nreceive) {
+		printf("roundtrip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
+		       ctx->min_rtt, ctx->avg_rtt, ctx->max_rtt, 0.0);
 	}
 }
 
@@ -320,17 +362,20 @@ static void parse_options(int argc, char **argv, struct ping_ctx *ctx)
 		{ "flood", 0, NULL, 2 },
 		{ "preload", required_argument, NULL, 3 },
 		{ "timeout", required_argument, NULL, 4 },
-		{ "linger", required_argument, NULL, 4 },
-		{ NULL, 0, NULL, 0},
+		{ "linger", required_argument, NULL, 5 },
+		{ "interval", required_argument, NULL, 6 },
+		{ NULL, 0, NULL, 0 },
 	};
 
 	int c;
 	ft_opterr = 1;
-	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:", longopts, NULL)) != -1) {
+	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:", longopts,
+				   NULL)) != -1) {
 		switch (c) {
 		case 'c':
 		case 0:
-			ctx->ping_cnt = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			ctx->ping_cnt =
+				parse_long_or_err(ft_optarg, 10, 0, UINT16_MAX);
 			break;
 		case 'v':
 		case 1:
@@ -342,15 +387,26 @@ static void parse_options(int argc, char **argv, struct ping_ctx *ctx)
 			break;
 		case 'l':
 		case 3:
-			ctx->preload = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			ctx->preload =
+				parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
 			break;
 		case 'w':
 		case 4:
-			ctx->timeout = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			ctx->timeout =
+				parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
 			break;
 		case 'W':
 		case 5:
-			ctx->linger = parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			ctx->linger =
+				parse_long_or_err(ft_optarg, 10, 0, INT_MAX);
+			break;
+		case 'i':
+		case 6:
+			ctx->interval =
+				parse_long_or_err(ft_optarg, 10, 1, INT_MAX);
+			break;
+		case '?':
+			exit(EXIT_FAILURE);
 		}
 	}
 	if (ft_optind >= argc)
@@ -368,7 +424,9 @@ int main(int argc, char **argv)
 		.padding = 0x00,
 		.force_numeric = 0,
 		.has_name = 0,
-		.interval = 1000,
+		.interval = 1,
+		.min_rtt = HUGE_VALF,
+		.max_rtt = -HUGE_VALF,
 	};
 	parse_options(argc, argv, &ctx);
 
@@ -392,10 +450,17 @@ int main(int argc, char **argv)
 	ctx.addr = res->ai_addr;
 	ctx.addrlen = res->ai_addrlen;
 
+	struct timeval timeout = {
+		.tv_sec = ctx.interval,
+		.tv_usec = 0,
+	};
+
 	int yes = 1;
 	if (setsockopt(ctx.sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
 	    setsockopt(ctx.sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
-		       sizeof(yes))) {
+		       sizeof(yes)) ||
+	    setsockopt(ctx.sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+		       sizeof(timeout))) {
 		ping_perror("setsockopt");
 		return EXIT_FAILURE;
 	}
@@ -408,7 +473,8 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	printf("PING %s (%s): %zu data bytes\n", ctx.host, ctx.addrstr, ctx.datalen);
+	printf("PING %s (%s): %zu data bytes\n", ctx.host, ctx.addrstr,
+	       ctx.datalen);
 	main_loop(&ctx);
 	print_stats(&ctx); //TODO actually print stats
 	freeaddrinfo(res);
