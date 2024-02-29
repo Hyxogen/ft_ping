@@ -5,7 +5,7 @@ OBJ_DIR		:= build
 LIBFT_DIR	:= libft
 LIBFT_LIB	:= $(LIBFT_DIR)/libft.a
 
-SRC_FILES	:= ping.c
+SRC_FILES	:= ping_new.c
 OBJ_FILES	:= $(patsubst %.c,$(OBJ_DIR)/%.o,$(SRC_FILES))
 DEP_FILES	:= $(patsubst %.c,$(OBJ_DIR)/%.d,$(SRC_FILES))
 
