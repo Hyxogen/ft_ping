@@ -303,7 +303,7 @@ static void linger(struct ping_rts *rts, struct icmpmsg *replybuf,
 	}
 
 	alarm(secs);
-	for (;;)
+	while (!exit_now)
 		recv_replies(rts, replybuf, buflen);
 }
 
