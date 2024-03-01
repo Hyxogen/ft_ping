@@ -152,7 +152,7 @@ static void update_stats(struct ping_rts *rts, float rtt)
 					rts->var_rtt) /
 					       rts->nrecv;
 	} else {
-		rts->var_rtt = (rtt - rts->avg_rtt) * (rtt - rts->avg_rtt);
+		rts->var_rtt = rts->avg_rtt;
 	}
 
 	rts->nrecv += 1;
@@ -290,7 +290,9 @@ static void send_echo(struct ping_rts *rts, struct icmpmsg *echobuf,
 static void linger(struct ping_rts *rts, struct icmpmsg *replybuf,
 		   size_t buflen)
 {
-	unsigned secs = MIN(alarm(0), rts->opts->linger);
+	unsigned secs = rts->opts->timeout ? MIN(alarm(0), rts->opts->linger) :
+					     rts->opts->linger;
+	assert(secs);
 
 	struct timeval zero = {
 		.tv_sec = 0,
@@ -303,7 +305,7 @@ static void linger(struct ping_rts *rts, struct icmpmsg *replybuf,
 	}
 
 	alarm(secs);
-	while (!exit_now)
+	while (!exit_now && rts->nrecv < rts->nxmit)
 		recv_replies(rts, replybuf, buflen);
 }
 
@@ -329,7 +331,7 @@ static void main_loop(struct ping_rts *rts)
 		send_echo(rts, echobuf, buflen, nseq++);
 		recv_replies(rts, replybuf, buflen);
 
-		if (nseq >= rts->opts->count)
+		if (rts->nxmit >= rts->opts->count)
 			break;
 
 		struct timeval now;
@@ -359,7 +361,7 @@ static void print_stats(const struct ping_rts *rts)
 	printf("--- %s ping statistics ---\n", rts->opts->host);
 	printf("%lu packets transmitted, %lu packets received, %.0f%% packet loss\n",
 	       rts->nxmit, rts->nrecv,
-	       (1.0f - rts->nrecv / rts->nxmit) * 100.0f);
+	       (1.0f - (float)rts->nrecv / (float)rts->nxmit) * 100.0f);
 
 	if (rts->opts->add_time && rts->nrecv) {
 		printf("roundtrip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
@@ -454,6 +456,9 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 
 	if (ft_optind >= argc)
 		error(EXIT_FAILURE, 0, "destination address required");
+
+	if (opts->flood)
+		opts->interval = 0;
 
 	opts->host = argv[ft_optind];
 	opts->add_time = opts->datalen >= sizeof(struct timeval);
