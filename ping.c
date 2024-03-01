@@ -586,6 +586,28 @@ static long parse_num_or_err(const char *s, int base, long min, long max)
 	return res;
 }
 
+static void print_help(void)
+{
+	fprintf(stderr,
+		"Send ICMP ECHO_REQUEST packets to network hosts\n"
+		"\n"
+		" Options:\n"
+		" -c, --count=NUMBER        stop after sender NUMBER packets\n"
+		" -i, --interval=NUMBER     wait NUMBER seconds between sending each packet\n"
+		"     --ttl=N               specify N as time-to-life\n"
+		" -v, --verbose             verbose output\n"
+		" -w, --timeout=N           stop after N seconds\n"
+		" -W, --linger=N            number of seconds to wait for response\n"
+		" -f, --flood               flood ping\n"
+		" -l, --preload=NUMBER      send NUMBER packets as fast as possible before\n"
+		"                           falling into normal mode of behavior\n"
+		" -p, --pattern=PATTERN     fill ICMP packet with given pattern (hex)\n"
+		" -q, --quiet               quiet output\n"
+		" -s, --size=NUMBER         sender NUMBER data octets\n"
+		"\n"
+		" -?, --help                give this help list\n");
+}
+
 static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 {
 	struct option longopts[] = {
@@ -600,12 +622,13 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 		{ "size", required_argument, NULL, 8 },
 		{ "ttl", required_argument, NULL, 9 },
 		{ "quiet", 0, NULL, 10 },
+		{ "help", 0, NULL, 11 },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	int c;
 	ft_opterr = 1;
-	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:p:s:q", longopts,
+	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:p:s:qh", longopts,
 				   NULL)) != -1) {
 		switch (c) {
 		case 'c':
@@ -660,7 +683,10 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 			quiet = true;
 			break;
 		default:
+		case 'h':
 		case '?':
+		case 11:
+			print_help();
 			exit(EXIT_FAILURE);
 			break;
 		}
