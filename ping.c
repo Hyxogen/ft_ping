@@ -374,7 +374,11 @@ static void recv_replies(struct ping_rts *rts, struct icmpmsg *replybuf,
 		}
 		if (flags & PING_RECVMSG_TRUNC ||
 		    replybuf->hdr.type != ICMP_ECHOREPLY ||
-		    replybuf->hdr.code || inet_checksum(replybuf, buflen)) {
+		    replybuf->hdr.code) {
+			continue;
+		}
+		if (inet_checksum(replybuf, buflen)) {
+			error(0, 0, "%s: checksum mismatch", rts->numaddr);
 			continue;
 		}
 		assert(!flags);
