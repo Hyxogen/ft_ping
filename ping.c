@@ -312,7 +312,7 @@ static void try_print_error(const struct ping_rts *rts)
 
 	ssize_t nread = recvmsg(rts->sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
 	if (nread < 0) {
-		if (errno != EAGAIN && errno  != EINTR)
+		if (errno != EAGAIN && errno != EINTR)
 			error(0, errno, "recvmsg");
 		return;
 	}
@@ -329,14 +329,15 @@ static void try_print_error(const struct ping_rts *rts)
 	if (err->ee_origin == SO_EE_ORIGIN_LOCAL) {
 		error(0, err->ee_errno, "local error");
 	} else if (err->ee_origin == SO_EE_ORIGIN_ICMP) {
-		if ((size_t) nread < sizeof(struct icmphdr))
+		if ((size_t)nread < sizeof(struct icmphdr))
 			return;
 
 		struct sockaddr_in *from =
 			(struct sockaddr_in *)SO_EE_OFFENDER(err);
 		char addrstr[INET_ADDRSTRLEN];
 
-		if (!inet_ntop(AF_INET, &from->sin_addr, addrstr, sizeof(addrstr))) {
+		if (!inet_ntop(AF_INET, &from->sin_addr, addrstr,
+			       sizeof(addrstr))) {
 			error(0, errno, "inet_ntop");
 			return;
 		}
@@ -347,7 +348,8 @@ static void try_print_error(const struct ping_rts *rts)
 		printf("\n");
 		if (rts->opts->verbose)
 			printf("ICMP: type %hhu, code %hhu, size %zu, id 0x%04hx, seq 0x%04hx\n",
-			       icmph.type, icmph.code, rts->opts->datalen + sizeof(struct icmphdr),
+			       icmph.type, icmph.code,
+			       rts->opts->datalen + sizeof(struct icmphdr),
 			       ntohs(icmph.un.echo.id), nseq);
 	} else {
 		assert(0 && "unexpected error origin");
@@ -610,7 +612,8 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 							 PING_MAX_DATALEN);
 			break;
 		case 9:
-			opts->ttl = parse_num_or_err(ft_optarg, 10, 1, UINT8_MAX);
+			opts->ttl =
+				parse_num_or_err(ft_optarg, 10, 1, UINT8_MAX);
 			break;
 		default:
 		case '?':
