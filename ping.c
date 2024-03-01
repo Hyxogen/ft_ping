@@ -626,6 +626,7 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 		{ NULL, 0, NULL, 0 },
 	};
 
+	bool q = false;
 	int c;
 	ft_opterr = 1;
 	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:p:s:qh", longopts,
@@ -642,10 +643,16 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 			break;
 		case 'f':
 		case 2:
+			if (getuid())
+				error(EXIT_FAILURE, 0,
+				      "flood mode can only be run by root");
 			opts->flood = true;
 			break;
 		case 'l':
 		case 3:
+			if (getuid())
+				error(EXIT_FAILURE, 0,
+				      "preload can only be used by root");
 			opts->preload =
 				parse_num_or_err(ft_optarg, 10, 0, UINT16_MAX);
 			break;
@@ -680,7 +687,7 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 			break;
 		case 'q':
 		case 10:
-			quiet = true;
+			q = true;
 			break;
 		default:
 		case 'h':
@@ -698,6 +705,7 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 	if (opts->flood)
 		opts->interval = 0;
 
+	quiet = q;
 	opts->host = argv[ft_optind];
 	opts->add_time = opts->datalen >= sizeof(struct timeval);
 }
