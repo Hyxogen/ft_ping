@@ -84,8 +84,8 @@ static int vprint_common(FILE *file, const char *restrict fmt, va_list ap)
 	return vfprintf(file, fmt, ap);
 }
 
-__attribute__((format(printf, 1, 2)))
-static int print(const char *restrict fmt, ...)
+__attribute__((format(printf, 1, 2))) static int print(const char *restrict fmt,
+						       ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -94,8 +94,8 @@ static int print(const char *restrict fmt, ...)
 	return res;
 }
 
-__attribute__((format(printf, 1, 2)))
-static int eprint(const char *restrict fmt, ...)
+__attribute__((format(printf, 1, 2))) static int
+eprint(const char *restrict fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
@@ -203,8 +203,8 @@ static void print_ping(const struct ping_rts *rts, uint16_t nseq, int ttl,
 {
 	if (!rts->opts->flood) {
 		print("%zu bytes from %s: icmp_seq=%hu ttl=%i",
-		       rts->opts->datalen + sizeof(struct icmphdr),
-		       rts->numaddr, nseq, ttl);
+		      rts->opts->datalen + sizeof(struct icmphdr), rts->numaddr,
+		      nseq, ttl);
 
 		if (rts->opts->add_time)
 			print(" time=%.3f ms", rtt);
@@ -263,7 +263,7 @@ static void print_icmph_desc(uint8_t type, uint8_t code, uint32_t info)
 			break;
 		default:
 			print("Destination Unreachable, Bad Code: 0x%02hhx",
-			       code);
+			      code);
 		}
 		break;
 	case ICMP_TIME_EXCEEDED:
@@ -347,7 +347,7 @@ static void try_print_error(const struct ping_rts *rts)
 
 	ssize_t nread = recvmsg(rts->sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
 	if (nread < 0) {
-		if (errno != EAGAIN && errno  != EINTR)
+		if (errno != EAGAIN && errno != EINTR)
 			error(0, errno, "recvmsg");
 		return;
 	}
@@ -364,14 +364,15 @@ static void try_print_error(const struct ping_rts *rts)
 	if (err->ee_origin == SO_EE_ORIGIN_LOCAL) {
 		error(0, err->ee_errno, "local error");
 	} else if (err->ee_origin == SO_EE_ORIGIN_ICMP) {
-		if ((size_t) nread < sizeof(struct icmphdr))
+		if ((size_t)nread < sizeof(struct icmphdr))
 			return;
 
 		struct sockaddr_in *from =
 			(struct sockaddr_in *)SO_EE_OFFENDER(err);
 		char addrstr[INET_ADDRSTRLEN];
 
-		if (!inet_ntop(AF_INET, &from->sin_addr, addrstr, sizeof(addrstr))) {
+		if (!inet_ntop(AF_INET, &from->sin_addr, addrstr,
+			       sizeof(addrstr))) {
 			error(0, errno, "inet_ntop");
 			return;
 		}
@@ -651,7 +652,8 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 							 PING_MAX_DATALEN);
 			break;
 		case 9:
-			opts->ttl = parse_num_or_err(ft_optarg, 10, 1, UINT8_MAX);
+			opts->ttl =
+				parse_num_or_err(ft_optarg, 10, 1, UINT8_MAX);
 			break;
 		case 'q':
 		case 10:
