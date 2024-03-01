@@ -21,8 +21,9 @@
 #include <sys/param.h>
 #include <linux/errqueue.h>
 
-const char *prog_name = NULL;
-volatile sig_atomic_t exit_now = 0;
+static const char *prog_name = NULL;
+static volatile sig_atomic_t exit_now = 0;
+static bool quiet = 0;
 
 #define PING_MAX_IPV4_LEN 65535
 #define PING_IPV4_HDR_LEN 20
@@ -70,19 +71,55 @@ struct ping_rts {
 #define PING_RECVMSG_ERR 2
 #define PING_RECVMSG_TRUNC 4
 
-__attribute__((format(printf, 3, 4))) static void error(int status, int errnum,
-							const char *fmt, ...)
+static void write_stdout(const void *buf, size_t count)
 {
-	fprintf(stderr, "%s: ", prog_name);
+	if (!quiet)
+		write(STDOUT_FILENO, buf, count);
+}
+
+static int vprint_common(FILE *file, const char *restrict fmt, va_list ap)
+{
+	if (quiet)
+		return 0;
+	return vfprintf(file, fmt, ap);
+}
+
+__attribute__((format(printf, 1, 2)))
+static int print(const char *restrict fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int res = vprint_common(stdout, fmt, ap);
+	va_end(ap);
+	return res;
+}
+
+__attribute__((format(printf, 1, 2)))
+static int eprint(const char *restrict fmt, ...)
+{
+	va_list ap;
+	va_start(ap, fmt);
+	int res = vprint_common(stderr, fmt, ap);
+	va_end(ap);
+	return res;
+}
+
+__attribute__((format(printf, 3, 4))) static void
+error(int status, int errnum, const char *restrict fmt, ...)
+{
+	if (quiet)
+		return;
+
+	eprint("%s: ", prog_name);
 
 	va_list ap;
 	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
+	vprint_common(stderr, fmt, ap);
 	va_end(ap);
 
 	if (errnum)
-		fprintf(stderr, ": %s", strerror(errnum));
-	fprintf(stderr, "\n");
+		eprint(": %s", strerror(errnum));
+	eprint("\n");
 
 	if (status)
 		exit(status);
@@ -165,15 +202,15 @@ static void print_ping(const struct ping_rts *rts, uint16_t nseq, int ttl,
 		       float rtt)
 {
 	if (!rts->opts->flood) {
-		printf("%zu bytes from %s: icmp_seq=%hu ttl=%i",
+		print("%zu bytes from %s: icmp_seq=%hu ttl=%i",
 		       rts->opts->datalen + sizeof(struct icmphdr),
 		       rts->numaddr, nseq, ttl);
 
 		if (rts->opts->add_time)
-			printf(" time=%.3f ms", rtt);
-		printf("\n");
+			print(" time=%.3f ms", rtt);
+		print("\n");
 	} else {
-		write(1, "\x08", 1);
+		write_stdout("\b", 1);
 	}
 }
 
@@ -207,84 +244,84 @@ static void print_icmph_desc(uint8_t type, uint8_t code, uint32_t info)
 	case ICMP_DEST_UNREACH:
 		switch (code) {
 		case ICMP_NET_UNREACH:
-			printf("Destination Net Unreachable");
+			print("Destination Net Unreachable");
 			break;
 		case ICMP_HOST_UNREACH:
-			printf("Destination Host Unreachable");
+			print("Destination Host Unreachable");
 			break;
 		case ICMP_PROT_UNREACH:
-			printf("Destination Protocol Unreachable");
+			print("Destination Protocol Unreachable");
 			break;
 		case ICMP_PORT_UNREACH:
-			printf("Destination Port Unreachable");
+			print("Destination Port Unreachable");
 			break;
 		case ICMP_FRAG_NEEDED:
-			printf("Frag needed and DF set (mtu = %u)", info);
+			print("Frag needed and DF set (mtu = %u)", info);
 			break;
 		case ICMP_SR_FAILED:
-			printf("Source Route Failed");
+			print("Source Route Failed");
 			break;
 		default:
-			printf("Destination Unreachable, Bad Code: 0x%02hhx",
+			print("Destination Unreachable, Bad Code: 0x%02hhx",
 			       code);
 		}
 		break;
 	case ICMP_TIME_EXCEEDED:
 		switch (code) {
 		case ICMP_EXC_TTL:
-			printf("Time to live exceeded");
+			print("Time to live exceeded");
 			break;
 		case ICMP_EXC_FRAGTIME:
-			printf("Frag reassembly time exceeded");
+			print("Frag reassembly time exceeded");
 			break;
 		default:
-			printf("Time exceeded, Bad Code: 0x%02hhx", code);
+			print("Time exceeded, Bad Code: 0x%02hhx", code);
 		}
 		break;
 	case ICMP_PARAMETERPROB:
-		printf("Parameter problem");
+		print("Parameter problem");
 		break;
 	case ICMP_SOURCE_QUENCH:
-		printf("Source Quench");
+		print("Source Quench");
 		break;
 	case ICMP_REDIRECT:
 		switch (code) {
 		case ICMP_REDIR_NET:
-			printf("Redirect Network");
+			print("Redirect Network");
 			break;
 		case ICMP_REDIR_HOST:
-			printf("Redirect Host");
+			print("Redirect Host");
 			break;
 		case ICMP_REDIR_NETTOS:
-			printf("Redirect Type of Service and Network");
+			print("Redirect Type of Service and Network");
 			break;
 		case ICMP_REDIR_HOSTTOS:
-			printf("Redirect Type of Service and Host");
+			print("Redirect Type of Service and Host");
 			break;
 		default:
-			printf("Redirect, Bad Code: 0x%02hhx", code);
+			print("Redirect, Bad Code: 0x%02hhx", code);
 		}
 		break;
 	case ICMP_ECHO:
-		printf("Echo Request");
+		print("Echo Request");
 		break;
 	case ICMP_ECHOREPLY:
-		printf("Echo Reply");
+		print("Echo Reply");
 		break;
 	case ICMP_TIMESTAMP:
-		printf("Timestamp");
+		print("Timestamp");
 		break;
 	case ICMP_TIMESTAMPREPLY:
-		printf("Timestamp Reply");
+		print("Timestamp Reply");
 		break;
 	case ICMP_INFO_REQUEST:
-		printf("Information Request");
+		print("Information Request");
 		break;
 	case ICMP_INFO_REPLY:
-		printf("Information Reply");
+		print("Information Reply");
 		break;
 	default:
-		printf("Unknown ICMP type: 0x%02hhx", type);
+		print("Unknown ICMP type: 0x%02hhx", type);
 		break;
 	}
 }
@@ -340,13 +377,14 @@ static void try_print_error(const struct ping_rts *rts)
 		}
 
 		uint16_t nseq = ntohs(icmph.un.echo.sequence);
-		printf("From %s icmp_seq=%hu ", addrstr, nseq);
+		print("From %s icmp_seq=%hu ", addrstr, nseq);
 		print_icmph_desc(err->ee_type, err->ee_code, err->ee_info);
-		printf("\n");
+		print("\n");
 		if (rts->opts->verbose)
-			printf("ICMP: type %hhu, code %hhu, size %zu, id 0x%04hx, seq 0x%04hx\n",
-			       icmph.type, icmph.code, rts->opts->datalen + sizeof(struct icmphdr),
-			       ntohs(icmph.un.echo.id), nseq);
+			print("ICMP: type %hhu, code %hhu, size %zu, id 0x%04hx, seq 0x%04hx\n",
+			      icmph.type, icmph.code,
+			      rts->opts->datalen + sizeof(struct icmphdr),
+			      ntohs(icmph.un.echo.id), nseq);
 	} else {
 		assert(0 && "unexpected error origin");
 	}
@@ -445,7 +483,7 @@ static void send_echo(struct ping_rts *rts, struct icmpmsg *echobuf,
 		error(0, 0, "sendto: unexpected shortcount");
 
 	if (rts->opts->flood)
-		write(1, ".", 1);
+		write_stdout(".", 1);
 
 	rts->nxmit += 1;
 }
@@ -560,12 +598,13 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 		{ "pattern", required_argument, NULL, 7 },
 		{ "size", required_argument, NULL, 8 },
 		{ "ttl", required_argument, NULL, 9 },
+		{ "quiet", 0, NULL, 10 },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	int c;
 	ft_opterr = 1;
-	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:p:s:", longopts,
+	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:p:s:q", longopts,
 				   NULL)) != -1) {
 		switch (c) {
 		case 'c':
@@ -613,6 +652,10 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 			break;
 		case 9:
 			opts->ttl = parse_num_or_err(ft_optarg, 10, 1, UINT8_MAX);
+			break;
+		case 'q':
+		case 10:
+			quiet = true;
 			break;
 		default:
 		case '?':
