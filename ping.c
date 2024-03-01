@@ -592,20 +592,20 @@ static void print_help(void)
 		"Send ICMP ECHO_REQUEST packets to network hosts\n"
 		"\n"
 		" Options:\n"
-		" -c, --count=NUMBER        stop after sender NUMBER packets\n"
-		" -i, --interval=NUMBER     wait NUMBER seconds between sending each packet\n"
-		"     --ttl=N               specify N as time-to-live\n"
-		" -v, --verbose             verbose output\n"
-		" -w, --timeout=N           stop after N seconds\n"
-		" -W, --linger=N            number of seconds to wait for response\n"
-		" -f, --flood               flood ping (root only)\n"
-		" -l, --preload=NUMBER      send NUMBER packets as fast as possible before\n"
+		"  -c, --count=NUMBER        stop after sender NUMBER packets\n"
+		"  -i, --interval=NUMBER     wait NUMBER seconds between sending each packet\n"
+		"      --ttl=N               specify N as time-to-live\n"
+		"  -v, --verbose             verbose output\n"
+		"  -w, --timeout=N           stop after N seconds\n"
+		"  -W, --linger=N            number of seconds to wait for response\n"
+		"  -f, --flood               flood ping (root only)\n"
+		"  -l, --preload=NUMBER      send NUMBER packets as fast as possible before\n"
 		"                           falling into normal mode of behavior (root only)\n"
-		" -p, --pattern=PATTERN     fill ICMP packet with given pattern (hex)\n"
-		" -q, --quiet               quiet output\n"
-		" -s, --size=NUMBER         sender NUMBER data octets\n"
+		"  -p, --pattern=PATTERN     fill ICMP packet with given pattern (hex)\n"
+		"  -q, --quiet               quiet output\n"
+		"  -s, --size=NUMBER         sender NUMBER data octets\n"
 		"\n"
-		" -?, --help                give this help list\n");
+		"  -?, --help                give this help list\n");
 }
 
 static void parse_opts(int argc, char **argv, struct ping_opts *opts)
@@ -700,7 +700,7 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 	}
 
 	if (ft_optind >= argc)
-		error(EXIT_FAILURE, 0, "destination address required");
+		error(EXIT_FAILURE, 0, "Destination address required");
 
 	if (opts->flood)
 		opts->interval = 0;
