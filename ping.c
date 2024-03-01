@@ -1,118 +1,183 @@
-#include <ft/getopt.h>
-#include <ft/stdlib.h>
-#include <ft/math.h>
-#include <stdlib.h>
-#include <sys/socket.h>
 #include <stdio.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <netdb.h>
-#include <netinet/ip_icmp.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
 #include <assert.h>
 #include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <arpa/inet.h>
 #include <stdarg.h>
 #include <limits.h>
-#include <signal.h>
+#include <errno.h>
+#include <ft/stdlib.h>
+#include <ft/string.h>
+#include <ft/math.h>
+#include <ft/getopt.h>
+#include <sys/time.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netdb.h>
+#include <netinet/ip_icmp.h>
+#include <arpa/inet.h>
+#include <sys/param.h>
 
-struct icmp_echo {
-	struct icmphdr header;
-	unsigned char data[];
+const char *prog_name = NULL;
+volatile sig_atomic_t exit_now = 0;
+
+#define PING_MAX_IPV4_LEN 65535
+#define PING_IPV4_HDR_LEN 20
+#define PING_ICMP_HDR_LEN 8
+#define PING_MAX_DATALEN \
+	(PING_MAX_IPV4_LEN - PING_IPV4_HDR_LEN - PING_ICMP_HDR_LEN)
+
+struct icmpmsg {
+	struct icmphdr hdr;
+	uint8_t data[];
 };
 
-static volatile sig_atomic_t exit_now = 0;
-
-struct ping_ctx {
-	int sockfd;
-
+struct ping_opts {
 	const char *host;
-
-	struct sockaddr_in addr;
-
-	size_t datalen;
-	unsigned char padding;
-	int add_time;
-
-	int force_numeric;
-
-	char name[256];
-	int has_name;
-
-	char addrstr[INET_ADDRSTRLEN];
-
-	unsigned long long ntransmit;
-	unsigned long long nreceive;
-
-	int verbose;
-	int flood;
-	int linger;
-	int timeout;
+	uint32_t datalen;
+	uint32_t count;
 	uint16_t preload;
-	uint32_t ping_cnt;
+	unsigned timeout;
+	unsigned linger;
+	unsigned interval;
+	uint8_t padding;
+	bool verbose;
+	bool flood;
+	bool add_time;
+};
 
-	useconds_t interval;
+struct ping_rts {
+	int sockfd;
+	struct sockaddr_in addr;
+	char numaddr[INET_ADDRSTRLEN];
+
+	uint64_t nxmit;
+	uint64_t nrecv;
 
 	float min_rtt;
-	float max_rtt;
 	float avg_rtt;
+	float max_rtt;
 	float var_rtt;
+
+	const struct ping_opts *opts;
 };
 
-static const char *program_name = NULL;
+#define PING_RECVMSG_ERR 1
+#define PING_RECVMSG_TRUNC 2
 
-static void ping_verror(const char *fmt, va_list ap)
+__attribute__((format(printf, 3, 4))) static void error(int status, int errnum,
+							const char *fmt, ...)
 {
-	fprintf(stderr, "%s: ", program_name);
+	fprintf(stderr, "%s: ", prog_name);
+
+	va_list ap;
+	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
-}
-
-__attribute__((format(printf, 1, 2))) static void ping_error(const char *fmt,
-							     ...)
-{
-	va_list ap;
-	va_start(ap, fmt);
-	ping_verror(fmt, ap);
 	va_end(ap);
+
+	if (errnum)
+		fprintf(stderr, ": %s", strerror(errnum));
+	fprintf(stderr, "\n");
+
+	if (status)
+		exit(status);
 }
 
-__attribute__((format(printf, 1, 2))) static void
-ping_error_and_exit(const char *fmt, ...)
+static int read_reply(int sockfd, struct icmpmsg *dest, size_t destlen,
+		      int *ttl, void *addr, size_t addrlen, struct timeval *ts,
+		      bool poll)
 {
-	va_list ap;
-	va_start(ap, fmt);
-	ping_verror(fmt, ap);
-	va_end(ap);
-	exit(EXIT_FAILURE);
-}
+	int res = 0;
+	struct iovec iov;
+	iov.iov_base = dest;
+	iov.iov_len = destlen;
 
-static void ping_perror(const char *s)
-{
-	const char *err = strerror(errno);
-	if (s)
-		ping_error("%s: %s\n", s, err);
-	else
-		ping_error("%s\n", err);
-}
+	char cbuf[512];
 
-static void ping_perror_and_exit(const char *s)
-{
-	ping_perror(s);
-	exit(EXIT_FAILURE);
-}
+	struct msghdr msg = {
+		.msg_name = addr,
+		.msg_namelen = addrlen,
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+		.msg_flags = 0,
+	};
 
-static long parse_long_or_err(const char *src, int base, long min, long max)
-{
-	char *end;
-	long res = ft_strtol(src, &end, base);
-	if (*end)
-		ping_error_and_exit("invalid value: '%s'\n", src);
-	if (res < min)
-		ping_error_and_exit("value too small: '%s'\n", src);
-	if (res > max)
-		ping_error_and_exit("value too large: '%s'\n", src);
+	ssize_t nread = recvmsg(sockfd, &msg, poll * MSG_DONTWAIT);
+	if (nread < 0) {
+		if (errno != EAGAIN && errno != EINTR)
+			error(0, errno, "recvmsg");
+		res |= PING_RECVMSG_ERR;
+		return res;
+	}
+
+	if (msg.msg_flags & MSG_TRUNC) {
+		res |= PING_RECVMSG_TRUNC;
+		return res;
+	}
+
+	assert(ttl);
+	*ttl = 0;
+
+	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+	while (cmsg) {
+		if (cmsg->cmsg_level == IPPROTO_IP &&
+		    cmsg->cmsg_type == IP_TTL) {
+			ft_memcpy(ttl, CMSG_DATA(cmsg), sizeof(*ttl));
+		} else if (cmsg->cmsg_level == SOL_SOCKET &&
+			   cmsg->cmsg_type == SCM_TIMESTAMP) {
+			ft_memcpy(ts, CMSG_DATA(cmsg), sizeof(*ts));
+		}
+		cmsg = CMSG_NXTHDR(&msg, cmsg);
+	}
 	return res;
+}
+
+//https://en.wikipedia.org/w/index.php?title=Algorithms_for_calculating_variance&oldid=1198125194#Welford's_online_algorithm
+static void update_stats(struct ping_rts *rts, float rtt)
+{
+	rts->min_rtt = ft_fminf(rts->min_rtt, rtt);
+	rts->max_rtt = ft_fmaxf(rts->max_rtt, rtt);
+
+	float old_avg = rts->avg_rtt;
+
+	rts->avg_rtt = (rtt + rts->nrecv * rts->avg_rtt) / (rts->nrecv + 1);
+
+	if (rts->nrecv) {
+		rts->var_rtt =
+			rts->var_rtt + ((rtt - old_avg) * (rtt - rts->avg_rtt) -
+					rts->var_rtt) /
+					       rts->nrecv;
+	} else {
+		rts->var_rtt = rts->avg_rtt;
+	}
+
+	rts->nrecv += 1;
+}
+
+static void print_ping(const struct ping_rts *rts, uint16_t nseq, int ttl,
+		       float rtt)
+{
+	if (!rts->opts->flood) {
+		printf("%zu bytes from %s: icmp_seq=%hu ttl=%i",
+		       rts->opts->datalen + sizeof(struct icmphdr),
+		       rts->numaddr, nseq, ttl);
+
+		if (rts->opts->add_time)
+			printf(" time=%.3f ms", rtt);
+		printf("\n");
+	} else {
+		write(1, "\x08", 1);
+	}
+}
+
+static float millis_elapsed(struct timeval start, struct timeval end)
+{
+	return (end.tv_sec - start.tv_sec) * 1000.0f +
+	       (end.tv_usec - start.tv_usec) / 1000.0f;
 }
 
 static uint16_t inet_checksum(const void *src, size_t len)
@@ -133,267 +198,193 @@ static uint16_t inet_checksum(const void *src, size_t len)
 	return (uint16_t)~sum;
 }
 
-static ssize_t recv_reply(int sockfd, struct icmp_echo *dest, size_t destlen,
-			  int *ttl, void *addr, size_t addrlen,
-			  struct timeval *ts)
+static void recv_replies(struct ping_rts *rts, struct icmpmsg *replybuf,
+			 size_t buflen)
 {
-	struct iovec iov;
-	iov.iov_base = dest;
-	iov.iov_len = destlen;
+	bool poll = rts->opts->flood;
 
-	char cbuf[512];
-	struct msghdr msg = {
-		.msg_name = addr,
-		.msg_namelen = addrlen,
-		.msg_iov = &iov,
-		.msg_iovlen = 1,
-		.msg_control = cbuf,
-		.msg_controllen = sizeof(cbuf),
-		.msg_flags = 0,
-	};
-
-	ssize_t nread = recvmsg(sockfd, &msg, 0);
-	if (nread < 0) {
-		ping_perror("recvmsg");
-		return -1;
-	}
-
-	if ((size_t)nread < destlen) {
-		ping_error("recvmsg: unexpected shortcount\n");
-		return -1;
-	}
-
-	if (msg.msg_flags & MSG_TRUNC) {
-		ping_error("recvmsg: unexpectedly large message\n");
-		return -1;
-	}
-
-	if (dest->header.type != ICMP_ECHOREPLY) {
-		ping_error("received unexpected icmp type\n");
-		return -1;
-	}
-	if (dest->header.code) {
-		ping_error("received unexpected icmp reply code\n");
-		return -1;
-	}
-
-	uint16_t check = inet_checksum(dest, destlen);
-	if (check) {
-		ping_error("icmp checksum invalid\n");
-		return -1;
-	}
-
-	assert(ttl);
-	*ttl = 0;
-
-	struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
-	while (cmsg) {
-		if (cmsg->cmsg_level == IPPROTO_IP &&
-		    cmsg->cmsg_type == IP_TTL) {
-			memcpy(ttl, CMSG_DATA(cmsg), sizeof(*ttl));
-		} else if (cmsg->cmsg_level == SOL_SOCKET &&
-			   cmsg->cmsg_type == SCM_TIMESTAMP) {
-			memcpy(ts, CMSG_DATA(cmsg), sizeof(*ts));
-		}
-		cmsg = CMSG_NXTHDR(&msg, cmsg);
-	}
-
-	return 0;
-}
-
-static int send_echo(const struct ping_ctx *ctx, struct icmp_echo *echo,
-		     size_t len, uint16_t seqn)
-{
-	echo->header.un.echo.sequence = htons(seqn);
-
-	size_t pad_offset = 0;
-	if (ctx->add_time) {
-		if (gettimeofday((struct timeval *)echo->data, NULL)) {
-			ping_perror("gettimeofday");
-			return 1;
-		}
-		pad_offset += sizeof(struct timeval);
-	}
-
-	if (pad_offset < ctx->datalen)
-		memset(echo->data + pad_offset, ctx->padding,
-		       ctx->datalen - pad_offset);
-
-	ssize_t nsent = sendto(ctx->sockfd, echo, len, 0,
-			       (const struct sockaddr *)&ctx->addr,
-			       sizeof(ctx->addr));
-	if (nsent < 0) {
-		ping_perror("sendto");
-		return 1;
-	}
-
-	if ((unsigned long long)nsent < len) {
-		ping_error("sendto: unexpected shortcount\n");
-		return 1;
-	}
-
-	return 0;
-}
-
-static float millis_elapsed(struct timeval start, struct timeval end)
-{
-	return (end.tv_sec - start.tv_sec) * 1000.0f +
-	       (end.tv_usec - start.tv_usec) / 1000.0f;
-}
-
-static int print_ping(struct ping_ctx *ctx, const struct icmp_echo *reply,
-		      int ttl, const struct sockaddr_in *from, float rtt)
-{
-	char addr[INET_ADDRSTRLEN];
-	if (!inet_ntop(AF_INET, &from->sin_addr, addr, sizeof(addr))) {
-		ping_perror("inet_ntop");
-		return EXIT_FAILURE;
-	}
-
-	if (!ctx->force_numeric && !ctx->has_name) {
-		//TODO NDI format conversion
-		if (getnameinfo((const struct sockaddr *)from, sizeof(*from),
-				ctx->name, sizeof(ctx->name), NULL, 0, 0))
-			ctx->force_numeric = 1;
-		else
-			ctx->has_name = 1;
-	}
-
-	printf("%zu bytes from ", ctx->datalen + sizeof(struct icmphdr));
-
-	int print_name = !ctx->force_numeric && ctx->has_name;
-
-	if (print_name)
-		printf("%s (", ctx->name);
-	printf("%s", addr);
-	if (print_name)
-		printf(")");
-
-	printf(": icmp_seq=%hu ttl=%i", ntohs(reply->header.un.echo.sequence),
-	       ttl);
-
-	if (ctx->add_time)
-		printf(" time=%.3f ms", rtt);
-	printf("\n");
-	return 0;
-}
-
-static float simple_sqrt(float f)
-{
-	double res = f/2.0;
-	for (int i = 0; i < 100; ++i)
-		res = (res + f / res) / 2.0;
-	return res;
-}
-
-//https://en.wikipedia.org/w/index.php?title=Algorithms_for_calculating_variance&oldid=1198125194#Welford's_online_algorithm
-static float update_stats(struct ping_ctx *ctx, const struct icmp_echo *reply,
-			 const struct timeval *ts)
-{
-	float rtt = 0.0f;
-	if (ctx->add_time) {
-		struct timeval sent;
-		memcpy(&sent, reply->data, sizeof(sent));
-		rtt = millis_elapsed(sent, *ts);
-
-		ctx->min_rtt = ft_fminf(ctx->min_rtt, rtt);
-		ctx->max_rtt = ft_fmaxf(ctx->min_rtt, rtt);
-
-		float old_avg = ctx->avg_rtt;
-
-		ctx->avg_rtt = (rtt + ctx->nreceive * ctx->avg_rtt) /
-			       (ctx->nreceive + 1);
-
-		if (ctx->nreceive) {
-			ctx->var_rtt = ctx->var_rtt +
-				       ((rtt - old_avg) * (rtt - ctx->avg_rtt) -
-					ctx->var_rtt) /
-					       ctx->nreceive;
-		} else {
-			ctx->var_rtt =
-				(rtt - ctx->avg_rtt) * (rtt - ctx->avg_rtt);
-		}
-	}
-	ctx->nreceive += 1;
-	return rtt;
-}
-
-static void main_loop(struct ping_ctx *ctx)
-{
-	const size_t len =
-		sizeof(struct icmp_echo) + ctx->datalen; //TODO + body size
-	struct icmp_echo *reply = malloc(len); //TODO calloc
-
-	uint16_t seqn = -1;
-	struct icmp_echo *echo = malloc(len); //TODO calloc
-	echo->header.type = ICMP_ECHO;
-	echo->header.code = 0;
-	echo->header.checksum = 0;
-	echo->header.un.echo.id = 0;
-
-	while (!exit_now) {
-		++seqn;
-
-		int rc = send_echo(ctx, echo, len, seqn);
-		if (rc)
-			continue;
-		ctx->ntransmit += 1;
-
-		int ttl = 0;
+	while (rts->nrecv < rts->nxmit) {
+		int ttl;
 		struct sockaddr_in from;
 		struct timeval ts;
-		memset(&from, 0, sizeof(from));
+		int flags = read_reply(rts->sockfd, replybuf, buflen, &ttl,
+				       &from, sizeof(from), &ts, poll);
 
-		struct timeval before;
-		if (gettimeofday(&before, NULL)) {
-			ping_perror("gettimeofday");
+		poll = true;
+
+		if (flags & PING_RECVMSG_ERR)
+			break;
+		if (flags & PING_RECVMSG_TRUNC ||
+		    replybuf->hdr.type != ICMP_ECHOREPLY ||
+		    replybuf->hdr.code || inet_checksum(replybuf, buflen))
 			continue;
+		assert(!flags);
+
+		float rtt = 0.0f;
+
+		if (rts->opts->add_time) {
+			struct timeval sent;
+			ft_memcpy(&sent, replybuf->data, sizeof(sent));
+			rtt = millis_elapsed(sent, ts);
 		}
 
-		rc = recv_reply(ctx->sockfd, reply, len, &ttl, &from,
-				sizeof(from), &ts);
-		if (!rc) {
-			float rtt = update_stats(ctx, reply, &ts);
-			print_ping(ctx, reply, ttl, &from, rtt);
-		}
+		uint16_t nseq = ntohs(replybuf->hdr.un.echo.sequence);
 
-		if (ctx->ntransmit >= ctx->ping_cnt)
+		update_stats(rts, rtt);
+		print_ping(rts, nseq, ttl, rtt);
+	}
+}
+
+static void init_echo(struct icmpmsg *echo, size_t n, uint8_t padding)
+{
+	echo->hdr.type = ICMP_ECHO;
+	echo->hdr.code = 0;
+	echo->hdr.checksum = 0;
+	echo->hdr.un.echo.id = 0;
+	echo->hdr.un.echo.sequence = 0;
+	memset(echo->data, padding, n - sizeof(echo->hdr));
+}
+
+static void gettimeofday_or_err(struct timeval *restrict tv,
+				struct timezone *restrict tz)
+{
+	if (gettimeofday(tv, tz))
+		error(EXIT_FAILURE, errno, "gettimeofday");
+}
+
+static void prepare_echo(struct ping_rts *rts, struct icmpmsg *echobuf,
+			 uint16_t nseq)
+{
+	echobuf->hdr.un.echo.sequence = htons(nseq);
+
+	if (rts->opts->add_time) {
+		struct timeval now;
+		gettimeofday_or_err(&now, NULL);
+		ft_memcpy(echobuf->data, &now, sizeof(now));
+	}
+}
+
+static void send_echo(struct ping_rts *rts, struct icmpmsg *echobuf,
+		      size_t buflen, uint16_t nseq)
+{
+	prepare_echo(rts, echobuf, nseq);
+
+	ssize_t nsent = sendto(rts->sockfd, echobuf, buflen, 0,
+			       (const struct sockaddr *)&rts->addr,
+			       sizeof(rts->addr));
+	if (nsent < 0) {
+		if (errno != EINTR && errno != EAGAIN)
+			error(0, errno, "sendto");
+		return;
+	}
+
+	if ((size_t)nsent < buflen)
+		error(0, 0, "sendto: unexpected shortcount");
+
+	if (rts->opts->flood)
+		write(1, ".", 1);
+
+	rts->nxmit += 1;
+}
+
+static void linger(struct ping_rts *rts, struct icmpmsg *replybuf,
+		   size_t buflen)
+{
+	unsigned secs = rts->opts->timeout ? MIN(alarm(0), rts->opts->linger) :
+					     rts->opts->linger;
+	assert(secs);
+
+	struct timeval zero = {
+		.tv_sec = 0,
+		.tv_usec = 0,
+	};
+	if (setsockopt(rts->sockfd, SOL_SOCKET, SO_RCVTIMEO, &zero,
+		       sizeof(zero))) {
+		error(0, errno, "setsockopt");
+		return;
+	}
+
+	alarm(secs);
+	while (!exit_now && rts->nrecv < rts->nxmit)
+		recv_replies(rts, replybuf, buflen);
+}
+
+static void main_loop(struct ping_rts *rts)
+{
+	const size_t buflen = rts->opts->datalen + sizeof(struct icmphdr);
+	struct icmpmsg *replybuf = malloc(buflen); // TODO calloc
+	struct icmpmsg *echobuf = malloc(buflen); // TODO calloc
+	if (!replybuf || !echobuf)
+		error(EXIT_FAILURE, errno, "malloc");
+
+	init_echo(echobuf, buflen, rts->opts->padding);
+
+	uint16_t nseq = 0;
+
+	for (uint16_t i = 0; i < rts->opts->preload; ++i)
+		send_echo(rts, echobuf, buflen, nseq++);
+
+	while (!exit_now) {
+		struct timeval start;
+		gettimeofday_or_err(&start, NULL);
+
+		send_echo(rts, echobuf, buflen, nseq++);
+		recv_replies(rts, replybuf, buflen);
+
+		if (rts->nxmit >= rts->opts->count)
 			break;
 
 		struct timeval now;
-		if (gettimeofday(&now, NULL)) {
-			ping_perror("gettimeofday");
-			continue;
-		}
+		gettimeofday_or_err(&now, NULL);
 
-		time_t diff = now.tv_sec - before.tv_sec;
-		if (diff >= ctx->interval || exit_now)
-			continue;
-
-		useconds_t sleep = (ctx->interval - diff) * 1000000 -
-				   (now.tv_usec - before.tv_usec);
-		usleep(sleep);
+		time_t diff = now.tv_sec - start.tv_sec;
+		if (diff < rts->opts->interval && !exit_now)
+			usleep((rts->opts->interval - diff) * 1000000 -
+			       (now.tv_usec - start.tv_usec));
 	}
-	free(reply);
-	free(echo);
+	if (!exit_now)
+		linger(rts, replybuf, buflen);
+	free(replybuf);
+	free(echobuf);
 }
 
-static void print_stats(const struct ping_ctx *ctx)
+static double simple_sqrt(double d)
 {
-	printf("--- %s ping statistics ---\n", ctx->host);
-	printf("%llu packets transmitted, %llu packets received, %.0f%% packet loss\n",
-	       ctx->ntransmit, ctx->nreceive,
-	       (1.0f - ctx->nreceive / ctx->ntransmit) * 100.0f);
+	double res = d / 2.0;
+	for (int i = 0; i < 100; ++i)
+		res = (res + d / res) / 2.0;
+	return res;
+}
 
-	if (ctx->add_time && ctx->nreceive) {
-		//TODO fix nan in stddev when ./ft_ping localhost -c1
+static void print_stats(const struct ping_rts *rts)
+{
+	printf("--- %s ping statistics ---\n", rts->opts->host);
+	printf("%lu packets transmitted, %lu packets received, %.0f%% packet loss\n",
+	       rts->nxmit, rts->nrecv,
+	       (1.0f - (float)rts->nrecv / (float)rts->nxmit) * 100.0f);
+
+	if (rts->opts->add_time && rts->nrecv) {
 		printf("roundtrip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
-		       ctx->min_rtt, ctx->avg_rtt, ctx->max_rtt,
-		       simple_sqrt(ctx->var_rtt));
+		       rts->min_rtt, rts->avg_rtt, rts->max_rtt,
+		       simple_sqrt(rts->var_rtt));
 	}
 }
 
-static void parse_options(int argc, char **argv, struct ping_ctx *ctx)
+static long parse_num_or_err(const char *s, int base, long min, long max)
+{
+	char *end;
+	long res = ft_strtol(s, &end, base);
+
+	if (*end)
+		error(EXIT_FAILURE, 0, "invalid value: '%s'", s);
+	if (res < min)
+		error(EXIT_FAILURE, 0, "value too small: '%s'", s);
+	if (res > max)
+		error(EXIT_FAILURE, 0, "value too large: '%s'", s);
+	return res;
+}
+
+static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 {
 	struct option longopts[] = {
 		{ "count", required_argument, NULL, 0 },
@@ -403,174 +394,186 @@ static void parse_options(int argc, char **argv, struct ping_ctx *ctx)
 		{ "timeout", required_argument, NULL, 4 },
 		{ "linger", required_argument, NULL, 5 },
 		{ "interval", required_argument, NULL, 6 },
+		{ "pattern", required_argument, NULL, 7 },
+		{ "size", required_argument, NULL, 8 },
 		{ NULL, 0, NULL, 0 },
 	};
 
 	int c;
 	ft_opterr = 1;
-	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:", longopts,
+	while ((c = ft_getopt_long(argc, argv, "c:vfl:w:W:i:p:s:", longopts,
 				   NULL)) != -1) {
 		switch (c) {
 		case 'c':
 		case 0:
-			ctx->ping_cnt =
-				parse_long_or_err(ft_optarg, 10, 0, UINT16_MAX);
+			opts->count =
+				parse_num_or_err(ft_optarg, 10, 1, UINT16_MAX);
 			break;
 		case 'v':
 		case 1:
-			ctx->verbose = 1;
+			opts->verbose = true;
 			break;
 		case 'f':
 		case 2:
-			ctx->flood = 1;
+			opts->flood = true;
 			break;
 		case 'l':
 		case 3:
-			ctx->preload =
-				parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			opts->preload =
+				parse_num_or_err(ft_optarg, 10, 0, UINT16_MAX);
 			break;
 		case 'w':
 		case 4:
-			ctx->timeout =
-				parse_long_or_err(ft_optarg, 10, 0, LONG_MAX);
+			opts->timeout =
+				parse_num_or_err(ft_optarg, 10, 1, UINT_MAX);
 			break;
 		case 'W':
 		case 5:
-			ctx->linger =
-				parse_long_or_err(ft_optarg, 10, 0, INT_MAX);
+			opts->linger =
+				parse_num_or_err(ft_optarg, 10, 1, UINT_MAX);
 			break;
 		case 'i':
 		case 6:
-			ctx->interval =
-				parse_long_or_err(ft_optarg, 10, 1, INT_MAX);
+			opts->interval =
+				parse_num_or_err(ft_optarg, 10, 1, UINT_MAX);
 			break;
+		case 'p':
+		case 7:
+			opts->padding =
+				parse_num_or_err(ft_optarg, 16, 0, 0xFF);
+			break;
+		case 's':
+		case 8:
+			opts->datalen = parse_num_or_err(ft_optarg, 10, 0,
+							 PING_MAX_DATALEN);
+			break;
+		default:
 		case '?':
 			exit(EXIT_FAILURE);
+			break;
 		}
 	}
+
 	if (ft_optind >= argc)
-		ping_error_and_exit("destination address required\n");
-	ctx->host = argv[ft_optind];
+		error(EXIT_FAILURE, 0, "destination address required");
+
+	if (opts->flood)
+		opts->interval = 0;
+
+	opts->host = argv[ft_optind];
+	opts->add_time = opts->datalen >= sizeof(struct timeval);
 }
 
-static void setup_socket(struct ping_ctx *ctx)
+static void get_address(struct ping_rts *rts)
 {
 	struct addrinfo hints, *res;
-	memset(&hints, 0, sizeof(hints));
+	ft_memset(&hints, 0, sizeof(hints));
+
 	hints.ai_family = AF_INET;
 	hints.ai_protocol = IPPROTO_ICMP;
 
-	int rc = getaddrinfo(ctx->host, NULL, &hints, &res);
+	int rc = getaddrinfo(rts->opts->host, NULL, &hints, &res);
 	if (rc < 0)
-		ping_error_and_exit("getaddrinfo: %s\n", gai_strerror(rc));
-	if (res->ai_addrlen != sizeof(ctx->addr))
-		ping_error_and_exit("this should never happen\n");
+		error(EXIT_FAILURE, 0, "%s: %s", rts->opts->host,
+		      gai_strerror(rc));
 
-	memcpy(&ctx->addr, res->ai_addr, sizeof(ctx->addr));
+	assert(res->ai_addrlen == sizeof(rts->addr));
+	ft_memcpy(&rts->addr, res->ai_addr, sizeof(rts->addr));
+
+	if (!inet_ntop(AF_INET, &rts->addr.sin_addr, rts->numaddr,
+		       sizeof(rts->numaddr)))
+		error(EXIT_FAILURE, errno, "inet_ntop");
+
 	freeaddrinfo(res);
-
-	ctx->sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
-	if (ctx->sockfd < 0)
-		ping_perror_and_exit("socket");
-
-	struct timeval timeout = {
-		.tv_sec = ctx->interval,
-		.tv_usec = 0,
-	};
-
-	int yes = 1;
-	if (setsockopt(ctx->sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
-	    setsockopt(ctx->sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
-		       sizeof(yes)) ||
-	    setsockopt(ctx->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-		       sizeof(timeout)))
-		ping_perror_and_exit("setsockopt");
-
-	if (!inet_ntop(AF_INET, &ctx->addr.sin_addr, ctx->addrstr,
-		       sizeof(ctx->addrstr)))
-		ping_perror_and_exit("inet_ntop");
 }
 
-static void sighandler(int sig)
+static void setup_socket(struct ping_rts *rts)
 {
-	(void)sig;
+	rts->sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+	if (rts->sockfd < 0)
+		error(EXIT_FAILURE, errno, "socket");
+
+	struct timeval timeout = {
+		.tv_sec = rts->opts->interval,
+		.tv_usec = 0,
+	};
+	int yes = 1;
+	if (setsockopt(rts->sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
+	    setsockopt(rts->sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
+		       sizeof(yes)) ||
+	    setsockopt(rts->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+		       sizeof(timeout)))
+		error(EXIT_FAILURE, errno, "setsockopt");
+}
+
+static void sighandler(int signum)
+{
+	(void)signum;
 	exit_now = 1;
 }
 
-static void setup_sighandlers()
+static void setup_sighandlers(void)
 {
 	struct sigaction act = {
 		.sa_handler = sighandler,
 	};
 	if (sigemptyset(&act.sa_mask))
-		ping_perror_and_exit("sigemptyset");
-	if (sigaction(SIGINT, &act, NULL))
-		ping_perror("sigaction");
+		error(EXIT_FAILURE, errno, "sigemptyset");
+	if (sigaction(SIGINT, &act, NULL) || sigaction(SIGALRM, &act, NULL))
+		error(EXIT_FAILURE, errno, "sigaction");
 }
 
-#ifndef TEST
+static void run_ping(struct ping_rts *rts)
+{
+	printf("PING %s (%s): %u data bytes\n", rts->opts->host, rts->numaddr,
+	       rts->opts->datalen);
+
+	alarm(rts->opts->timeout);
+
+	main_loop(rts);
+	print_stats(rts);
+}
+
+static void cleanup_rts(struct ping_rts *rts)
+{
+	if (close(rts->sockfd))
+		error(0, errno, "close");
+}
+
 int main(int argc, char **argv)
 {
-	program_name = argv[0];
+	prog_name = argv[0];
 
-	struct ping_ctx ctx = {
+	struct ping_opts opts = {
+		.host = NULL,
 		.datalen = 56,
-		.padding = 0x00,
-		.force_numeric = 0,
-		.has_name = 0,
+		.count = UINT_MAX,
+		.preload = 0,
+		.timeout = 0,
+		.linger = 10,
 		.interval = 1,
-		.min_rtt = HUGE_VALF,
-		.max_rtt = -HUGE_VALF,
-		.avg_rtt = 0.0f,
-		.var_rtt = 0.0f,
-		.ping_cnt = UINT32_MAX,
+		.padding = 0xff,
+		.verbose = false,
+		.flood = false,
 	};
-	parse_options(argc, argv, &ctx);
-	ctx.add_time = ctx.datalen > sizeof(struct timeval);
+	parse_opts(argc, argv, &opts);
 
-	setup_socket(&ctx);
+	struct ping_rts rts = {
+		.opts = &opts,
+		.nxmit = 0,
+		.nrecv = 0,
+		.min_rtt = HUGE_VALF,
+		.avg_rtt = 0.0,
+		.max_rtt = -HUGE_VALF,
+		.var_rtt = 0.0,
+	};
+
+	get_address(&rts);
+	setup_socket(&rts);
 	setup_sighandlers();
 
-	printf("PING %s (%s): %zu data bytes\n", ctx.host, ctx.addrstr,
-	       ctx.datalen);
-	main_loop(&ctx);
-	print_stats(&ctx); //TODO actually print stats
+	run_ping(&rts);
+
+	cleanup_rts(&rts);
 	return EXIT_SUCCESS;
 }
-
-#else
-
-#define ASSERT_U16_EQUAL_IMPL(a, astr, b, bstr, file, line)                         \
-	do {                                                                        \
-		if ((uint16_t)(a) != (uint16_t)(b)) {                               \
-			fprintf(stderr,                                             \
-				"%s:%i: Assertion `%s == %s` failed. %hu != %hu\n", \
-				file, line, astr, bstr, a, b);                      \
-			abort();                                                    \
-		}                                                                   \
-	} while (0)
-
-#define ASSERT_U16_EQUAL(a, b) \
-	ASSERT_U16_EQUAL_IMPL(a, #a, b, #b, __FILE__, __LINE__)
-
-static void test_inet_checksum()
-{
-	uint16_t zero = 0;
-	assert(inet_checksum(&zero, sizeof(zero)) == 0xffff);
-
-	for (uint32_t i = 0; i < 0x10000; ++i) {
-		if (i < 0xFF) {
-			ASSERT_U16_EQUAL(inet_checksum(&i, 1), ~(i << 8));
-		}
-		ASSERT_U16_EQUAL(inet_checksum(&i, 2), ~i);
-	}
-
-	uint16_t ab[] = { 0xffff, 0x00ab };
-	ASSERT_U16_EQUAL(inet_checksum(ab, sizeof(ab)), ~0x00ab);
-}
-
-int main()
-{
-	test_inet_checksum();
-}
-#endif
