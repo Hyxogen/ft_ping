@@ -444,7 +444,7 @@ static void init_echo(struct icmpmsg *echo, size_t n, uint8_t padding)
 	echo->hdr.checksum = 0;
 	echo->hdr.un.echo.id = 0;
 	echo->hdr.un.echo.sequence = 0;
-	memset(echo->data, padding, n - sizeof(echo->hdr));
+	ft_memset(echo->data, padding, n - sizeof(echo->hdr));
 }
 
 static void gettimeofday_or_err(struct timeval *restrict tv,
