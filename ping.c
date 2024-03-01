@@ -594,7 +594,7 @@ static void print_help(void)
 		" Options:\n"
 		" -c, --count=NUMBER        stop after sender NUMBER packets\n"
 		" -i, --interval=NUMBER     wait NUMBER seconds between sending each packet\n"
-		"     --ttl=N               specify N as time-to-life\n"
+		"     --ttl=N               specify N as time-to-live\n"
 		" -v, --verbose             verbose output\n"
 		" -w, --timeout=N           stop after N seconds\n"
 		" -W, --linger=N            number of seconds to wait for response\n"
