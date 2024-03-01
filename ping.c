@@ -19,6 +19,7 @@
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
 #include <sys/param.h>
+#include <linux/errqueue.h>
 
 const char *prog_name = NULL;
 volatile sig_atomic_t exit_now = 0;
@@ -43,6 +44,7 @@ struct ping_opts {
 	unsigned linger;
 	unsigned interval;
 	uint8_t padding;
+	uint8_t ttl;
 	bool verbose;
 	bool flood;
 	bool add_time;
@@ -64,8 +66,9 @@ struct ping_rts {
 	const struct ping_opts *opts;
 };
 
-#define PING_RECVMSG_ERR 1
-#define PING_RECVMSG_TRUNC 2
+#define PING_RECVMSG_EAGAIN 1
+#define PING_RECVMSG_ERR 2
+#define PING_RECVMSG_TRUNC 4
 
 __attribute__((format(printf, 3, 4))) static void error(int status, int errnum,
 							const char *fmt, ...)
@@ -108,8 +111,10 @@ static int read_reply(int sockfd, struct icmpmsg *dest, size_t destlen,
 
 	ssize_t nread = recvmsg(sockfd, &msg, poll * MSG_DONTWAIT);
 	if (nread < 0) {
-		if (errno != EAGAIN && errno != EINTR)
-			error(0, errno, "recvmsg");
+		//TODO use check MSG_ERRQUEUE in flags to set a flag in the
+		//return
+		if (errno == EAGAIN)
+			res |= PING_RECVMSG_EAGAIN;
 		res |= PING_RECVMSG_ERR;
 		return res;
 	}
@@ -198,6 +203,157 @@ static uint16_t inet_checksum(const void *src, size_t len)
 	return (uint16_t)~sum;
 }
 
+static void print_icmph_desc(uint8_t type, uint8_t code, uint32_t info)
+{
+	switch (type) {
+	case ICMP_DEST_UNREACH:
+		switch (code) {
+		case ICMP_NET_UNREACH:
+			printf("Destination Net Unreachable");
+			break;
+		case ICMP_HOST_UNREACH:
+			printf("Destination Host Unreachable");
+			break;
+		case ICMP_PROT_UNREACH:
+			printf("Destination Protocol Unreachable");
+			break;
+		case ICMP_PORT_UNREACH:
+			printf("Destination Port Unreachable");
+			break;
+		case ICMP_FRAG_NEEDED:
+			printf("Frag needed and DF set (mtu = %u)", info);
+			break;
+		case ICMP_SR_FAILED:
+			printf("Source Route Failed");
+			break;
+		default:
+			printf("Destination Unreachable, Bad Code: 0x%02hhx",
+			       code);
+		}
+		break;
+	case ICMP_TIME_EXCEEDED:
+		switch (code) {
+		case ICMP_EXC_TTL:
+			printf("Time to live exceeded");
+			break;
+		case ICMP_EXC_FRAGTIME:
+			printf("Frag reassembly time exceeded");
+			break;
+		default:
+			printf("Time exceeded, Bad Code: 0x%02hhx", code);
+		}
+		break;
+	case ICMP_PARAMETERPROB:
+		printf("Parameter problem");
+		break;
+	case ICMP_SOURCE_QUENCH:
+		printf("Source Quench");
+		break;
+	case ICMP_REDIRECT:
+		switch (code) {
+		case ICMP_REDIR_NET:
+			printf("Redirect Network");
+			break;
+		case ICMP_REDIR_HOST:
+			printf("Redirect Host");
+			break;
+		case ICMP_REDIR_NETTOS:
+			printf("Redirect Type of Service and Network");
+			break;
+		case ICMP_REDIR_HOSTTOS:
+			printf("Redirect Type of Service and Host");
+			break;
+		default:
+			printf("Redirect, Bad Code: 0x%02hhx", code);
+		}
+		break;
+	case ICMP_ECHO:
+		printf("Echo Request");
+		break;
+	case ICMP_ECHOREPLY:
+		printf("Echo Reply");
+		break;
+	case ICMP_TIMESTAMP:
+		printf("Timestamp");
+		break;
+	case ICMP_TIMESTAMPREPLY:
+		printf("Timestamp Reply");
+		break;
+	case ICMP_INFO_REQUEST:
+		printf("Information Request");
+		break;
+	case ICMP_INFO_REPLY:
+		printf("Information Reply");
+		break;
+	default:
+		printf("Unknown ICMP type: 0x%02hhx", type);
+		break;
+	}
+}
+
+static void try_print_error(const struct ping_rts *rts)
+{
+	struct iovec iov;
+	struct icmphdr icmph;
+	char cbuf[512];
+
+	iov.iov_base = &icmph;
+	iov.iov_len = sizeof(icmph);
+
+	struct msghdr msg = {
+		.msg_name = NULL,
+		.msg_namelen = 0,
+		.msg_iov = &iov,
+		.msg_iovlen = 1,
+		.msg_flags = 0,
+		.msg_control = cbuf,
+		.msg_controllen = sizeof(cbuf),
+	};
+
+	ssize_t nread = recvmsg(rts->sockfd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+	if (nread < 0) {
+		if (errno != EAGAIN && errno  != EINTR)
+			error(0, errno, "recvmsg");
+		return;
+	}
+
+	struct sock_extended_err *err = NULL;
+	for (struct cmsghdr *cmsgh = CMSG_FIRSTHDR(&msg); cmsgh;
+	     cmsgh = CMSG_NXTHDR(&msg, cmsgh)) {
+		if (cmsgh->cmsg_level == SOL_IP &&
+		    cmsgh->cmsg_type == IP_RECVERR)
+			err = (struct sock_extended_err *)CMSG_DATA(cmsgh);
+	}
+	assert(err);
+
+	if (err->ee_origin == SO_EE_ORIGIN_LOCAL) {
+		error(0, err->ee_errno, "local error");
+	} else if (err->ee_origin == SO_EE_ORIGIN_ICMP) {
+		if ((size_t) nread < sizeof(struct icmphdr))
+			return;
+
+		struct sockaddr_in *from =
+			(struct sockaddr_in *)SO_EE_OFFENDER(err);
+		char addrstr[INET_ADDRSTRLEN];
+
+		if (!inet_ntop(AF_INET, &from->sin_addr, addrstr, sizeof(addrstr))) {
+			error(0, errno, "inet_ntop");
+			return;
+		}
+
+		uint16_t nseq = ntohs(icmph.un.echo.sequence);
+		printf("From %s icmp_seq=%hu ", addrstr, nseq);
+		print_icmph_desc(err->ee_type, err->ee_code, err->ee_info);
+		printf("\n");
+		if (rts->opts->verbose)
+			printf("ICMP: type %hhu, code %hhu, size %zu, id 0x%04hx, seq 0x%04hx\n",
+			       icmph.type, icmph.code, rts->opts->datalen + sizeof(struct icmphdr),
+			       ntohs(icmph.un.echo.id), nseq);
+	} else {
+		assert(0 && "unexpected error origin");
+	}
+}
+
 static void recv_replies(struct ping_rts *rts, struct icmpmsg *replybuf,
 			 size_t buflen)
 {
@@ -212,12 +368,17 @@ static void recv_replies(struct ping_rts *rts, struct icmpmsg *replybuf,
 
 		poll = true;
 
-		if (flags & PING_RECVMSG_ERR)
+		if (flags & PING_RECVMSG_EAGAIN)
 			break;
+		if (flags & PING_RECVMSG_ERR) {
+			try_print_error(rts);
+			continue;
+		}
 		if (flags & PING_RECVMSG_TRUNC ||
 		    replybuf->hdr.type != ICMP_ECHOREPLY ||
-		    replybuf->hdr.code || inet_checksum(replybuf, buflen))
+		    replybuf->hdr.code || inet_checksum(replybuf, buflen)) {
 			continue;
+		}
 		assert(!flags);
 
 		float rtt = 0.0f;
@@ -396,6 +557,7 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 		{ "interval", required_argument, NULL, 6 },
 		{ "pattern", required_argument, NULL, 7 },
 		{ "size", required_argument, NULL, 8 },
+		{ "ttl", required_argument, NULL, 9 },
 		{ NULL, 0, NULL, 0 },
 	};
 
@@ -446,6 +608,9 @@ static void parse_opts(int argc, char **argv, struct ping_opts *opts)
 		case 8:
 			opts->datalen = parse_num_or_err(ft_optarg, 10, 0,
 							 PING_MAX_DATALEN);
+			break;
+		case 9:
+			opts->ttl = parse_num_or_err(ft_optarg, 10, 1, UINT8_MAX);
 			break;
 		default:
 		case '?':
@@ -499,6 +664,10 @@ static void setup_socket(struct ping_rts *rts)
 	};
 	int yes = 1;
 	if (setsockopt(rts->sockfd, SOL_IP, IP_RECVTTL, &yes, sizeof(yes)) ||
+	    setsockopt(rts->sockfd, SOL_IP, IP_RECVERR, &yes, sizeof(yes)) ||
+	    (rts->opts->ttl &&
+	     setsockopt(rts->sockfd, SOL_IP, IP_TTL, &rts->opts->ttl,
+			sizeof(rts->opts->ttl))) ||
 	    setsockopt(rts->sockfd, SOL_SOCKET, SO_TIMESTAMP, &yes,
 		       sizeof(yes)) ||
 	    setsockopt(rts->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
@@ -555,6 +724,7 @@ int main(int argc, char **argv)
 		.padding = 0xff,
 		.verbose = false,
 		.flood = false,
+		.ttl = 0,
 	};
 	parse_opts(argc, argv, &opts);
 
